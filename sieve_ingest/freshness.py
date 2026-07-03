@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -182,5 +183,7 @@ _ADAPTERS = {
 def detect(conn, source) -> List[ChangedURL]:
     """Dispatch to the source's adapter. Returns changed URLs (may be empty)."""
     adapter = _ADAPTERS.get(source.get('adapter_type', 'sitemap'), _detect_sitemap)
-    with httpx.Client(timeout=25.0, follow_redirects=True) as client:
+    # Generous timeout — some canonical sitemaps (web.dev, MDN) are large/slow.
+    timeout = httpx.Timeout(float(os.getenv('INGEST_HTTP_TIMEOUT', '45')), connect=15.0)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         return adapter(conn, source, client)
