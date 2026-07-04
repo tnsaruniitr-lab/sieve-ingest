@@ -249,7 +249,20 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
         cur.execute("SELECT id FROM sieve.rules WHERE rule_key=%s LIMIT 1", (key,))
         existing = cur.fetchone()
         if existing:
-            cur.execute("UPDATE sieve.rules SET last_verified=now() WHERE rule_key=%s", (key,))
+            # Refresh last_verified; and BACKFILL/UPGRADE source_url when the new
+            # page is more specific (more path depth) or the existing has none.
+            # Never blanks an existing URL — only improves it. No data lost.
+            cur.execute("SELECT source_url FROM sieve.rules WHERE rule_key=%s", (key,))
+            cur_url = (cur.fetchone()[0] or '')
+            more_specific = bool(source_url) and (
+                not cur_url or
+                source_url.rstrip('/').count('/') > cur_url.rstrip('/').count('/'))
+            if more_specific:
+                cur.execute("UPDATE sieve.rules SET source_url=%s, document_id=%s, "
+                            "last_verified=now() WHERE rule_key=%s",
+                            (source_url, doc_id, key))
+            else:
+                cur.execute("UPDATE sieve.rules SET last_verified=now() WHERE rule_key=%s", (key,))
             return 'refreshed'
         cur.execute("SELECT COALESCE(MAX(NULLIF(id,'')::bigint),0)+1 FROM sieve.rules "
                     "WHERE id ~ '^[0-9]+$'")
