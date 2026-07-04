@@ -130,8 +130,41 @@ def _sitemap_urls(client, sitemap_url: str, limit: int = 300) -> List[tuple]:
     return out[:limit]
 
 
+def _probe_url(conn, source, client, loc, lastmod=None):
+    """Conditional-GET + content-hash a SINGLE page. Returns a ChangedURL if the
+    page is new/changed (so its rules get THIS exact URL), else None. Shared by
+    the sitemap and url_list adapters — this is what guarantees per-page (not
+    hub) provenance: extraction stamps each rule with `loc`."""
+    prev = db.get_url_state(conn, loc)
+    headers = dict(UA)
+    if prev and prev.get('etag'):
+        headers['If-None-Match'] = prev['etag']
+    if prev and prev.get('last_modified'):
+        headers['If-Modified-Since'] = prev['last_modified']
+    try:
+        r = client.get(loc, headers=headers)
+    except Exception:
+        return None
+    if r.status_code == 304:  # server says unchanged
+        db.save_url_state(conn, loc, source['source_id'], prev.get('etag'),
+                          lastmod or (prev or {}).get('last_modified'), prev.get('content_hash'))
+        return None
+    if r.status_code != 200:
+        return None
+    text = _main_text(r.text)
+    h = _norm_hash(text)
+    etag = r.headers.get('ETag')
+    if prev and prev.get('content_hash') == h:
+        db.save_url_state(conn, loc, source['source_id'], etag, lastmod, h)
+        return None
+    return ChangedURL(url=loc, change_type=('new' if not prev else 'modified'),
+                      signal='content_hash', old_hash=(prev or {}).get('content_hash'),
+                      new_hash=h, text=text)
+
+
 def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedURL]:
-    """Two-stage: sitemap lastmod cheap-filter, then conditional-GET + content-hash."""
+    """Two-stage: sitemap lastmod cheap-filter, then conditional-GET + content-hash.
+    Each changed URL is a specific page, so rules extracted from it get its exact URL."""
     sm = source.get('sitemap_url')
     if not sm:
         return []
@@ -144,32 +177,31 @@ def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedUR
             continue
         if fetched >= max_fetch:
             break
-        # Stage 2 — conditional GET + content hash.
-        headers = dict(UA)
-        if prev and prev.get('etag'):
-            headers['If-None-Match'] = prev['etag']
-        if prev and prev.get('last_modified'):
-            headers['If-Modified-Since'] = prev['last_modified']
-        try:
-            r = client.get(loc, headers=headers)
-        except Exception:
-            continue
         fetched += 1
-        if r.status_code == 304:  # server says unchanged
-            db.save_url_state(conn, loc, source['source_id'], prev.get('etag'), lastmod,
-                              prev.get('content_hash'))
-            continue
-        if r.status_code != 200:
-            continue
-        text = _main_text(r.text)
-        h = _norm_hash(text)
-        etag = r.headers.get('ETag')
-        if prev and prev.get('content_hash') == h:
-            db.save_url_state(conn, loc, source['source_id'], etag, lastmod, h)
-            continue
-        changed.append(ChangedURL(url=loc, change_type=('new' if not prev else 'modified'),
-                                   signal='content_hash', old_hash=(prev or {}).get('content_hash'),
-                                   new_hash=h, text=text))
+        cu = _probe_url(conn, source, client, loc, lastmod)
+        if cu:
+            changed.append(cu)
+    return changed
+
+
+def _detect_url_list(conn, source, client, max_fetch: int = 60) -> List[ChangedURL]:
+    """Crawl an EXPLICIT list of exact doc-page URLs (source.seed_urls). For
+    sources with no clean SEO sitemap (Google Search Central, Perplexity, OpenAI,
+    Bing), this captures each rule's PRECISE page URL instead of a generic hub."""
+    urls = source.get('seed_urls') or []
+    if isinstance(urls, str):
+        import json
+        try:
+            urls = json.loads(urls)
+        except Exception:
+            urls = [u.strip() for u in urls.split(',') if u.strip()]
+    changed: List[ChangedURL] = []
+    for i, loc in enumerate(urls):
+        if i >= max_fetch:
+            break
+        cu = _probe_url(conn, source, client, loc)
+        if cu:
+            changed.append(cu)
     return changed
 
 
@@ -177,6 +209,7 @@ _ADAPTERS = {
     'github_release': _detect_github_release,
     'changelog': _detect_changelog,
     'sitemap': _detect_sitemap,
+    'url_list': _detect_url_list,
 }
 
 

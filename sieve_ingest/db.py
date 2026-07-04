@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS sieve.source_registry (
     tier           smallint NOT NULL DEFAULT 3,
     root_url       text NOT NULL,
     sitemap_url    text,
+    seed_urls      jsonb,                        -- explicit exact-page URLs for the url_list adapter
     crawl_cadence_days int NOT NULL DEFAULT 30,
     last_crawled_at timestamptz,
     last_seen_marker text,                   -- version tag / max lastmod / feed ts
@@ -95,6 +96,9 @@ def init_schema(conn=None) -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(CONTROL_SCHEMA)
+            # seed_urls may be absent on a source_registry created before this column.
+            cur.execute("ALTER TABLE sieve.source_registry "
+                        "ADD COLUMN IF NOT EXISTS seed_urls jsonb")
             # Provenance columns on the brain tables for newly-ingested rows.
             for t in ('rules', 'principles', 'anti_patterns'):
                 cur.execute(f"""
@@ -117,19 +121,24 @@ def init_schema(conn=None) -> None:
 # ---------------------------------------------------------------------------
 
 def upsert_source(conn, s: Dict[str, Any]) -> None:
+    from psycopg2.extras import Json
+    params = {'adapter_type': 'sitemap', 'tier': 3, 'sitemap_url': None,
+              'seed_urls': None, 'crawl_cadence_days': 30, 'enabled': True,
+              'notes': None, **s}
+    params['seed_urls'] = Json(params['seed_urls']) if params.get('seed_urls') else None
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO sieve.source_registry
                 (source_id, canonical_org, adapter_type, tier, root_url,
-                 sitemap_url, crawl_cadence_days, enabled, notes)
+                 sitemap_url, seed_urls, crawl_cadence_days, enabled, notes)
             VALUES (%(source_id)s,%(canonical_org)s,%(adapter_type)s,%(tier)s,%(root_url)s,
-                    %(sitemap_url)s,%(crawl_cadence_days)s,%(enabled)s,%(notes)s)
+                    %(sitemap_url)s,%(seed_urls)s,%(crawl_cadence_days)s,%(enabled)s,%(notes)s)
             ON CONFLICT (source_id) DO UPDATE SET
                 canonical_org=EXCLUDED.canonical_org, adapter_type=EXCLUDED.adapter_type,
                 tier=EXCLUDED.tier, root_url=EXCLUDED.root_url, sitemap_url=EXCLUDED.sitemap_url,
+                seed_urls=EXCLUDED.seed_urls,
                 crawl_cadence_days=EXCLUDED.crawl_cadence_days, notes=EXCLUDED.notes
-        """, {**{'adapter_type': 'sitemap', 'tier': 3, 'sitemap_url': None,
-                 'crawl_cadence_days': 30, 'enabled': True, 'notes': None}, **s})
+        """, params)
 
 
 def due_sources(conn) -> List[Dict[str, Any]]:
