@@ -38,6 +38,39 @@ log = logging.getLogger('ingest.agent')
 MAX_URLS_PER_SOURCE = int(os.getenv('MAX_URLS_PER_SOURCE', '15'))
 GAVE_UP_AFTER = int(os.getenv('GAVE_UP_AFTER', '3'))
 
+# Observability (all optional, all best-effort — a broken alert never breaks a run):
+#   HEALTHCHECK_PING_URL  dead-man's switch (e.g. healthchecks.io): pinged on
+#                         success, <url>/fail on partial/failed. A MISSED ping
+#                         is the signal that the cron never ran at all.
+#   ALERT_WEBHOOK_URL     POSTed a JSON digest when a run isn't clean or any
+#                         source hits a 3+ failure streak.
+HEALTHCHECK_PING_URL = os.getenv('HEALTHCHECK_PING_URL', '')
+ALERT_WEBHOOK_URL = os.getenv('ALERT_WEBHOOK_URL', '')
+
+
+def _notify(summary: dict, outcomes: list) -> None:
+    """Fire the dead-man ping + failure webhook. Never raises."""
+    import httpx
+    ok = summary.get('status') == 'done'
+    streaks = [o for o in outcomes
+               if o.get('consecutive_failures', 0) >= GAVE_UP_AFTER]
+    if HEALTHCHECK_PING_URL:
+        try:
+            url = HEALTHCHECK_PING_URL if ok else HEALTHCHECK_PING_URL.rstrip('/') + '/fail'
+            httpx.get(url, timeout=10)
+        except Exception as e:
+            log.warning('healthcheck ping failed: %s', e)
+    if ALERT_WEBHOOK_URL and (not ok or streaks):
+        try:
+            httpx.post(ALERT_WEBHOOK_URL, timeout=10, json={
+                'service': 'sieve-ingest', 'summary': summary,
+                'failing_streaks': [{'source_id': o['source_id'],
+                                     'consecutive_failures': o['consecutive_failures'],
+                                     'error': o.get('error')} for o in streaks],
+            })
+        except Exception as e:
+            log.warning('alert webhook failed: %s', e)
+
 # extract_page statuses that consume the change (url_state saved).
 _CONSUMED = ('extracted', 'empty', 'irrelevant')
 
@@ -54,6 +87,8 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
         log.warning('detect failed for %s: %s', s['source_id'], e)
         out['status'] = 'detect_failed'
         out['error'] = str(e)[:300]
+        out['consecutive_failures'] = db.update_source_health(
+            conn, s['source_id'], ok=False, error=f'detect: {e}')
         return out  # source NOT marked crawled — retried next cycle
 
     all_consumed = True
@@ -61,6 +96,14 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
         out['changes'] += 1
         change_id = db.record_change(conn, run_id, s['source_id'], ch.url,
                                      ch.change_type, ch.signal, ch.old_hash, ch.new_hash)
+        if ch.change_type == 'removed':
+            # Page is gone — retire its rules (never delete), drop the
+            # fingerprint so a resurrected page re-enters as 'new'.
+            n = db.retire_rules_for_url(conn, ch.url)
+            log.info('  %s GONE — retired %d rule(s)', ch.url, n)
+            db.update_change_outcome(conn, change_id, 'retired', 0, 0)
+            out['retired'] = out.get('retired', 0) + n
+            continue
         try:
             counts = extract.ingest_page(conn, ch, s)
         except Exception as e:
@@ -96,11 +139,15 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
 
     if out['failed']:
         out['status'] = 'extract_failed'
+        out['consecutive_failures'] = db.update_source_health(
+            conn, s['source_id'], ok=False,
+            error=f"{out['failed']} extraction failure(s)")
         # Do NOT mark the source crawled: the unconsumed changes must be retried
         # at the NEXT cron slot, not after a full 7-30 day cadence. Re-detection
         # of the consumed URLs is cheap (lastmod filter / 304s / hash match).
         return out
 
+    db.update_source_health(conn, s['source_id'], ok=True)
     # Version markers (github_release) only advance when nothing was left behind,
     # so a failed extraction can't permanently eat the release.
     marker = None
@@ -121,6 +168,14 @@ def run_cycle() -> dict:
 
         outcomes = [_process_source(conn, run_id, s) for s in sources]
 
+        # Same-cycle embeddings: new rules become vector-retrievable before the
+        # auditor's next audit (no-op without OPENAI_API_KEY; failures defer).
+        try:
+            embedded = db.embed_missing_rules(conn)
+        except Exception as e:
+            log.warning('embedding pass failed (deferred): %s', e)
+            embedded = 0
+
         sources_changed = sum(1 for o in outcomes if o['changes'])
         urls_changed = sum(o['changes'] for o in outcomes)
         objects_written = sum(o['rules_new'] for o in outcomes)
@@ -132,10 +187,12 @@ def run_cycle() -> dict:
                       urls_changed=urls_changed, objects_written=objects_written)
         summary = {'run_id': run_id, 'status': status, 'sources_checked': len(sources),
                    'sources_changed': sources_changed, 'urls_changed': urls_changed,
-                   'rules_written': objects_written,
+                   'rules_written': objects_written, 'rules_embedded': embedded,
+                   'rules_retired': sum(o.get('retired', 0) for o in outcomes),
                    'failed_sources': [o['source_id'] for o in outcomes
                                       if o['status'] != 'ok']}
         log.info('run %s %s: %s', run_id, status, summary)
+        _notify(summary, outcomes)
         return summary
     except Exception as e:
         # A crash must never leave the run stuck 'running' with no trace.
@@ -145,6 +202,7 @@ def run_cycle() -> dict:
                               detail={'error': str(e)[:500]})
             except Exception:
                 log.exception('could not record failed run %s', run_id)
+        _notify({'run_id': run_id, 'status': 'failed', 'error': str(e)[:300]}, [])
         raise
     finally:
         conn.close()

@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS sieve.source_registry (
     last_crawled_at timestamptz,
     last_seen_marker text,                   -- version tag / max lastmod / feed ts
     enabled        boolean NOT NULL DEFAULT true,
-    notes          text
+    notes          text,
+    consecutive_failures int NOT NULL DEFAULT 0,  -- health: reset on any ok cycle
+    last_ok_at     timestamptz,                   -- health: last cycle with status=ok
+    last_error     text                           -- health: most recent failure detail
 );
 
 -- One row per ingestion cycle (for observability + 'when did we last refresh').
@@ -108,7 +111,21 @@ def init_schema(conn=None) -> None:
             # Columns may be absent on tables created before they were added.
             cur.execute("ALTER TABLE sieve.source_registry "
                         "ADD COLUMN IF NOT EXISTS seed_urls jsonb, "
-                        "ADD COLUMN IF NOT EXISTS url_filter text")
+                        "ADD COLUMN IF NOT EXISTS url_filter text, "
+                        "ADD COLUMN IF NOT EXISTS consecutive_failures int NOT NULL DEFAULT 0, "
+                        "ADD COLUMN IF NOT EXISTS last_ok_at timestamptz, "
+                        "ADD COLUMN IF NOT EXISTS last_error text, "
+                        "ADD COLUMN IF NOT EXISTS crawl_cursor jsonb")
+            # Sequence-based ids for brain inserts: MAX(id)+1 races when the CLI
+            # and the cron run concurrently. Guarded setval never rewinds.
+            for t in ('rules', 'documents'):
+                cur.execute(f"CREATE SEQUENCE IF NOT EXISTS sieve.{t}_ingest_id_seq")
+                cur.execute(f"""
+                    SELECT setval('sieve.{t}_ingest_id_seq', GREATEST(
+                        (SELECT last_value FROM sieve.{t}_ingest_id_seq),
+                        (SELECT COALESCE(MAX(NULLIF(id,'')::bigint),0) FROM sieve.{t}
+                         WHERE id ~ '^[0-9]+$')))
+                """)
             cur.execute("ALTER TABLE sieve.ingest_changes "
                         "ADD COLUMN IF NOT EXISTS extract_status text NOT NULL DEFAULT 'detected', "
                         "ADD COLUMN IF NOT EXISTS rules_new int, "
@@ -129,7 +146,8 @@ def init_schema(conn=None) -> None:
                         ADD COLUMN IF NOT EXISTS extracted_at timestamptz,
                         ADD COLUMN IF NOT EXISTS last_verified timestamptz,
                         ADD COLUMN IF NOT EXISTS rule_key text,
-                        ADD COLUMN IF NOT EXISTS superseded_by text
+                        ADD COLUMN IF NOT EXISTS superseded_by text,
+                        ADD COLUMN IF NOT EXISTS url_provenance text
                 """)
         log.info('control schema + provenance columns ready')
     finally:
@@ -192,6 +210,53 @@ def mark_source_crawled(conn, source_id: str, marker: Optional[str]) -> None:
         cur.execute("UPDATE sieve.source_registry SET last_crawled_at=now(), "
                     "last_seen_marker=COALESCE(%s, last_seen_marker) WHERE source_id=%s",
                     (marker, source_id))
+
+
+def get_crawl_cursor(conn, source_id: str) -> Dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT crawl_cursor FROM sieve.source_registry WHERE source_id=%s",
+                    (source_id,))
+        row = cur.fetchone()
+        return (row[0] or {}) if row else {}
+
+
+def save_crawl_cursor(conn, source_id: str, cursor: Dict[str, Any]) -> None:
+    from psycopg2.extras import Json
+    with conn.cursor() as cur:
+        cur.execute("UPDATE sieve.source_registry SET crawl_cursor=%s WHERE source_id=%s",
+                    (Json(cursor), source_id))
+
+
+def pending_retry_urls(conn, source_id: str, limit: int = 20) -> List[str]:
+    """URLs whose most recent change is still 'failed' (extraction never
+    succeeded, change never consumed). The rotation cursor must re-probe these
+    FIRST or they'd be stranded until the window wraps back around."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT ON (url) url, extract_status
+            FROM sieve.ingest_changes
+            WHERE source_id=%s
+            ORDER BY url, change_id DESC
+        """, (source_id,))
+        return [u for u, st in cur.fetchall() if st == 'failed'][:limit]
+
+
+def update_source_health(conn, source_id: str, ok: bool, error: Optional[str] = None) -> int:
+    """Health ledger per source: ok resets the failure streak; a failure
+    increments it. Returns the new consecutive_failures count (alerting keys
+    off this in the Phase-2 digest)."""
+    with conn.cursor() as cur:
+        if ok:
+            cur.execute("UPDATE sieve.source_registry SET consecutive_failures=0, "
+                        "last_ok_at=now(), last_error=NULL WHERE source_id=%s "
+                        "RETURNING consecutive_failures", (source_id,))
+        else:
+            cur.execute("UPDATE sieve.source_registry SET "
+                        "consecutive_failures=consecutive_failures+1, last_error=%s "
+                        "WHERE source_id=%s RETURNING consecutive_failures",
+                        ((error or '')[:300], source_id))
+        row = cur.fetchone()
+        return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +360,7 @@ def upsert_document(conn, source_url, source_org, title, domain_tag) -> str:
         if row:
             cur.execute("UPDATE sieve.documents SET title=%s WHERE id=%s", (title, row[0]))
             return row[0]
-        cur.execute("SELECT COALESCE(MAX(NULLIF(id,'')::bigint),0)+1 FROM sieve.documents "
-                    "WHERE id ~ '^[0-9]+$'")
+        cur.execute("SELECT nextval('sieve.documents_ingest_id_seq')")
         new_id = str(cur.fetchone()[0])
         cur.execute("""
             INSERT INTO sieve.documents (id, title, source_type, domain_tag, source_url,
@@ -304,6 +368,19 @@ def upsert_document(conn, source_url, source_org, title, domain_tag) -> str:
             VALUES (%s,%s,'ingest',%s,%s,%s, now())
         """, (new_id, title, domain_tag, source_url, source_org))
         return new_id
+
+
+def retire_rules_for_url(conn, source_url: str) -> int:
+    """The page a rule was extracted from is gone (404/410) — retire its rules.
+    Never deletes: status='retired' keeps the record; the auditor's retrieval
+    filters on status so retired guidance is unciteable. Re-extraction of a
+    matching rule_key reactivates (see upsert_rule)."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE sieve.rules SET status='retired' "
+                    "WHERE source_url=%s AND status='active'", (source_url,))
+        n = cur.rowcount
+        cur.execute("DELETE FROM sieve.url_state WHERE url=%s", (source_url,))
+        return n
 
 
 def _rule_key(name: str, if_cond: str) -> str:
@@ -321,9 +398,10 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
         cur.execute("SELECT id FROM sieve.rules WHERE rule_key=%s LIMIT 1", (key,))
         existing = cur.fetchone()
         if existing:
-            # Refresh last_verified; and BACKFILL/UPGRADE source_url when the new
-            # page is more specific (more path depth) or the existing has none.
-            # Never blanks an existing URL — only improves it. No data lost.
+            # Refresh last_verified (+ REACTIVATE if it was retired — the source
+            # page proving it is live again); BACKFILL/UPGRADE source_url when
+            # the new page is more specific (more path depth) or the existing
+            # has none. Never blanks an existing URL — only improves it.
             cur.execute("SELECT source_url FROM sieve.rules WHERE rule_key=%s", (key,))
             cur_url = (cur.fetchone()[0] or '')
             more_specific = bool(source_url) and (
@@ -331,23 +409,70 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
                 source_url.rstrip('/').count('/') > cur_url.rstrip('/').count('/'))
             if more_specific:
                 cur.execute("UPDATE sieve.rules SET source_url=%s, document_id=%s, "
-                            "last_verified=now() WHERE rule_key=%s",
+                            "url_provenance='extracted', last_verified=now(), "
+                            "status='active' WHERE rule_key=%s",
                             (source_url, doc_id, key))
             else:
-                cur.execute("UPDATE sieve.rules SET last_verified=now() WHERE rule_key=%s", (key,))
+                cur.execute("UPDATE sieve.rules SET last_verified=now(), "
+                            "status='active' WHERE rule_key=%s", (key,))
             return 'refreshed'
-        cur.execute("SELECT COALESCE(MAX(NULLIF(id,'')::bigint),0)+1 FROM sieve.rules "
-                    "WHERE id ~ '^[0-9]+$'")
+        cur.execute("SELECT nextval('sieve.rules_ingest_id_seq')")
         new_id = str(cur.fetchone()[0])
         cur.execute("""
             INSERT INTO sieve.rules
                 (id, name, rule_type, if_condition, then_logic, domain_tag,
                  confidence_score, source_refs_json, status, created_at,
-                 source_org, source_url, document_id, extracted_at, last_verified, rule_key)
+                 source_org, source_url, document_id, extracted_at, last_verified,
+                 rule_key, url_provenance)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active', now(),
-                    %s,%s,%s, now(), now(), %s)
+                    %s,%s,%s, now(), now(), %s, 'extracted')
         """, (new_id, rule.get('name'), rule.get('rule_type', 'ingested'),
               rule.get('if_condition'), rule.get('then_logic'), rule.get('domain_tag', 'general'),
               str(rule.get('confidence_score', 0.8)), f'[{doc_id}]',
               source_org, source_url, doc_id, key))
         return 'new'
+
+
+def embed_missing_rules(conn, limit: int = 1000) -> int:
+    """Make freshly-written rules retrievable by the auditor's VECTOR search in
+    the same cycle they land (they are FTS-visible immediately, but invisible
+    to semantic retrieval until embedded). No-ops without OPENAI_API_KEY or a
+    pgvector column. text-embedding-3-small = the auditor's query space."""
+    key = os.getenv('OPENAI_API_KEY')
+    if not key:
+        return 0
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SELECT id, name, if_condition, then_logic FROM sieve.rules "
+                        "WHERE embedding IS NULL AND status='active' "
+                        "ORDER BY extracted_at DESC NULLS LAST LIMIT %s", (limit,))
+        except Exception:
+            return 0  # no embedding column on this DB
+        rows = cur.fetchall()
+    if not rows:
+        return 0
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=key)
+    except Exception as e:
+        log.warning('openai SDK unavailable — embeddings deferred: %s', e)
+        return 0
+    model = os.getenv('EMBED_MODEL', 'text-embedding-3-small')
+    done = 0
+    for i in range(0, len(rows), 200):
+        batch = rows[i:i + 200]
+        texts = [' | '.join(filter(None, (n, c, t)))[:4000] for _, n, c, t in batch]
+        try:
+            resp = client.embeddings.create(model=model, input=texts)
+        except Exception as e:
+            log.warning('embedding batch failed (deferred to next cycle): %s', e)
+            break
+        with conn.cursor() as cur:
+            for (rid, *_), emb in zip(batch, resp.data):
+                vec = '[' + ','.join(f'{x:.7f}' for x in emb.embedding) + ']'
+                cur.execute("UPDATE sieve.rules SET embedding=%s::vector WHERE id=%s",
+                            (vec, rid))
+                done += 1
+    if done:
+        log.info('embedded %d new rules', done)
+    return done
