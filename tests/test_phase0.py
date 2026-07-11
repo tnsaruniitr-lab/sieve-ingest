@@ -238,7 +238,9 @@ def test_seed_insert_only_preserves_operator_fix(conn, monkeypatch):
     registry.seed(conn, force=True)  # deliberate code→DB sync
     row = q1(conn, "SELECT sitemap_url, enabled FROM sieve.source_registry "
                    "WHERE source_id='moz-blog'")
-    assert row[0] == 'https://moz.com/blog/sitemap.xml', 'force syncs code values'
+    code_value = next(s['sitemap_url'] for s in conftest.ORIG_SEED
+                      if s['source_id'] == 'moz-blog')
+    assert row[0] == code_value, 'force syncs code values'
     assert row[1] is False, 'operator disable ALWAYS survives, even --force'
 
 

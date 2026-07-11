@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS sieve.source_registry (
     last_crawled_at timestamptz,
     last_seen_marker text,                   -- version tag / max lastmod / feed ts
     enabled        boolean NOT NULL DEFAULT true,
-    notes          text
+    notes          text,
+    consecutive_failures int NOT NULL DEFAULT 0,  -- health: reset on any ok cycle
+    last_ok_at     timestamptz,                   -- health: last cycle with status=ok
+    last_error     text                           -- health: most recent failure detail
 );
 
 -- One row per ingestion cycle (for observability + 'when did we last refresh').
@@ -108,7 +111,20 @@ def init_schema(conn=None) -> None:
             # Columns may be absent on tables created before they were added.
             cur.execute("ALTER TABLE sieve.source_registry "
                         "ADD COLUMN IF NOT EXISTS seed_urls jsonb, "
-                        "ADD COLUMN IF NOT EXISTS url_filter text")
+                        "ADD COLUMN IF NOT EXISTS url_filter text, "
+                        "ADD COLUMN IF NOT EXISTS consecutive_failures int NOT NULL DEFAULT 0, "
+                        "ADD COLUMN IF NOT EXISTS last_ok_at timestamptz, "
+                        "ADD COLUMN IF NOT EXISTS last_error text")
+            # Sequence-based ids for brain inserts: MAX(id)+1 races when the CLI
+            # and the cron run concurrently. Guarded setval never rewinds.
+            for t in ('rules', 'documents'):
+                cur.execute(f"CREATE SEQUENCE IF NOT EXISTS sieve.{t}_ingest_id_seq")
+                cur.execute(f"""
+                    SELECT setval('sieve.{t}_ingest_id_seq', GREATEST(
+                        (SELECT last_value FROM sieve.{t}_ingest_id_seq),
+                        (SELECT COALESCE(MAX(NULLIF(id,'')::bigint),0) FROM sieve.{t}
+                         WHERE id ~ '^[0-9]+$')))
+                """)
             cur.execute("ALTER TABLE sieve.ingest_changes "
                         "ADD COLUMN IF NOT EXISTS extract_status text NOT NULL DEFAULT 'detected', "
                         "ADD COLUMN IF NOT EXISTS rules_new int, "
@@ -192,6 +208,24 @@ def mark_source_crawled(conn, source_id: str, marker: Optional[str]) -> None:
         cur.execute("UPDATE sieve.source_registry SET last_crawled_at=now(), "
                     "last_seen_marker=COALESCE(%s, last_seen_marker) WHERE source_id=%s",
                     (marker, source_id))
+
+
+def update_source_health(conn, source_id: str, ok: bool, error: Optional[str] = None) -> int:
+    """Health ledger per source: ok resets the failure streak; a failure
+    increments it. Returns the new consecutive_failures count (alerting keys
+    off this in the Phase-2 digest)."""
+    with conn.cursor() as cur:
+        if ok:
+            cur.execute("UPDATE sieve.source_registry SET consecutive_failures=0, "
+                        "last_ok_at=now(), last_error=NULL WHERE source_id=%s "
+                        "RETURNING consecutive_failures", (source_id,))
+        else:
+            cur.execute("UPDATE sieve.source_registry SET "
+                        "consecutive_failures=consecutive_failures+1, last_error=%s "
+                        "WHERE source_id=%s RETURNING consecutive_failures",
+                        ((error or '')[:300], source_id))
+        row = cur.fetchone()
+        return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +329,7 @@ def upsert_document(conn, source_url, source_org, title, domain_tag) -> str:
         if row:
             cur.execute("UPDATE sieve.documents SET title=%s WHERE id=%s", (title, row[0]))
             return row[0]
-        cur.execute("SELECT COALESCE(MAX(NULLIF(id,'')::bigint),0)+1 FROM sieve.documents "
-                    "WHERE id ~ '^[0-9]+$'")
+        cur.execute("SELECT nextval('sieve.documents_ingest_id_seq')")
         new_id = str(cur.fetchone()[0])
         cur.execute("""
             INSERT INTO sieve.documents (id, title, source_type, domain_tag, source_url,
@@ -336,8 +369,7 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
             else:
                 cur.execute("UPDATE sieve.rules SET last_verified=now() WHERE rule_key=%s", (key,))
             return 'refreshed'
-        cur.execute("SELECT COALESCE(MAX(NULLIF(id,'')::bigint),0)+1 FROM sieve.rules "
-                    "WHERE id ~ '^[0-9]+$'")
+        cur.execute("SELECT nextval('sieve.rules_ingest_id_seq')")
         new_id = str(cur.fetchone()[0])
         cur.execute("""
             INSERT INTO sieve.rules

@@ -54,6 +54,8 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
         log.warning('detect failed for %s: %s', s['source_id'], e)
         out['status'] = 'detect_failed'
         out['error'] = str(e)[:300]
+        out['consecutive_failures'] = db.update_source_health(
+            conn, s['source_id'], ok=False, error=f'detect: {e}')
         return out  # source NOT marked crawled — retried next cycle
 
     all_consumed = True
@@ -96,11 +98,15 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
 
     if out['failed']:
         out['status'] = 'extract_failed'
+        out['consecutive_failures'] = db.update_source_health(
+            conn, s['source_id'], ok=False,
+            error=f"{out['failed']} extraction failure(s)")
         # Do NOT mark the source crawled: the unconsumed changes must be retried
         # at the NEXT cron slot, not after a full 7-30 day cadence. Re-detection
         # of the consumed URLs is cheap (lastmod filter / 304s / hash match).
         return out
 
+    db.update_source_health(conn, s['source_id'], ok=True)
     # Version markers (github_release) only advance when nothing was left behind,
     # so a failed extraction can't permanently eat the release.
     marker = None

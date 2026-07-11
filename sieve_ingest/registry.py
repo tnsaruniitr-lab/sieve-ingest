@@ -64,8 +64,16 @@ SEED_SOURCES = [
          notes='Core Web Vitals / performance. url_filter keeps the crawl on '
                'content paths (the Jul-6 run burned budget on locale dupes).'),
     dict(source_id='w3c', canonical_org='W3C', tier=1,
-         adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://www.w3.org/TR/', sitemap_url=None),
+         adapter_type='url_list', crawl_cadence_days=30,
+         root_url='https://www.w3.org/TR/',
+         seed_urls=[
+             'https://www.w3.org/TR/WCAG22/',
+             'https://www.w3.org/TR/wai-aria-1.2/',
+             'https://www.w3.org/TR/appmanifest/',
+         ],
+         notes='w3.org has NO sitemap (probed 2026-07-11: /sitemap.xml and '
+               '/TR/sitemap.xml both 404) — url_list of the SEO/AEO-adjacent '
+               'specs instead.'),
     dict(source_id='mdn', canonical_org='MDN', tier=1,
          adapter_type='sitemap', crawl_cadence_days=30,
          root_url='https://developer.mozilla.org',
@@ -101,16 +109,29 @@ SEED_SOURCES = [
                'email-open-rate each produced 8 "rules").'),
     dict(source_id='ahrefs-blog', canonical_org='Ahrefs', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://ahrefs.com/blog', sitemap_url='https://ahrefs.com/blog/sitemap.xml'),
+         root_url='https://ahrefs.com/blog',
+         sitemap_url='https://ahrefs.com/blog/post-sitemap.xml',
+         notes='post-sitemap.xml is the direct urlset (probed 200, 2026-07-11); '
+               'the old /blog/sitemap.xml 404s.'),
     dict(source_id='semrush-blog', canonical_org='Semrush', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://www.semrush.com/blog', sitemap_url=None),
+         root_url='https://www.semrush.com/blog',
+         sitemap_url='https://www.semrush.com/sitemap.xml',
+         url_filter=r'^/blog/',
+         notes='no blog-only sitemap exists (probed 2026-07-11) — root index + '
+               'url_filter keeps the crawl on /blog/.'),
     dict(source_id='moz-blog', canonical_org='Moz', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://moz.com/blog', sitemap_url='https://moz.com/blog/sitemap.xml'),
+         root_url='https://moz.com/blog',
+         sitemap_url='https://moz.com/blog-sitemap.xml',
+         notes='blog-sitemap.xml is the direct urlset (probed 200, 2026-07-11); '
+               'the old /blog/sitemap.xml 404s.'),
     dict(source_id='search-engine-land', canonical_org='Search Engine Land', tier=3,
          adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://searchengineland.com', sitemap_url=None),
+         root_url='https://searchengineland.com',
+         sitemap_url='https://searchengineland.com/sitemap_index.xml',
+         notes='sitemap_index.xml probed 200 2026-07-11; site rate-limits (429) — '
+               'the 20-probe cap keeps us polite.'),
 ]
 
 
