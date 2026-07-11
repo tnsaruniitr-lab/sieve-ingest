@@ -132,23 +132,27 @@ def init_schema(conn=None) -> None:
                         "ADD COLUMN IF NOT EXISTS rules_refreshed int")
             # Provenance columns on the brain tables for newly-ingested rows.
             # Even a no-op ALTER takes an ACCESS EXCLUSIVE lock, and the live
-            # auditor reads these tables — only ALTER when actually missing.
+            # auditor reads these tables — so ALTER only the columns ACTUALLY
+            # missing (per-column, not gated on one sentinel: gating the whole
+            # block on 'superseded_by' silently skipped 'url_provenance' once a
+            # newer column was added to the list — a real prod miss).
+            _brain_cols = {
+                'source_url': 'text', 'document_id': 'text',
+                'extracted_at': 'timestamptz', 'last_verified': 'timestamptz',
+                'rule_key': 'text', 'superseded_by': 'text',
+                'url_provenance': 'text',
+            }
             for t in ('rules', 'principles', 'anti_patterns'):
-                cur.execute("SELECT 1 FROM information_schema.columns "
-                            "WHERE table_schema='sieve' AND table_name=%s "
-                            "AND column_name='superseded_by'", (t,))
-                if cur.fetchone():
+                cur.execute("SELECT column_name FROM information_schema.columns "
+                            "WHERE table_schema='sieve' AND table_name=%s", (t,))
+                have = {r[0] for r in cur.fetchall()}
+                missing = [(c, ty) for c, ty in _brain_cols.items() if c not in have]
+                if not missing:
                     continue
-                cur.execute(f"""
-                    ALTER TABLE sieve.{t}
-                        ADD COLUMN IF NOT EXISTS source_url text,
-                        ADD COLUMN IF NOT EXISTS document_id text,
-                        ADD COLUMN IF NOT EXISTS extracted_at timestamptz,
-                        ADD COLUMN IF NOT EXISTS last_verified timestamptz,
-                        ADD COLUMN IF NOT EXISTS rule_key text,
-                        ADD COLUMN IF NOT EXISTS superseded_by text,
-                        ADD COLUMN IF NOT EXISTS url_provenance text
-                """)
+                adds = ', '.join(f'ADD COLUMN IF NOT EXISTS {c} {ty}' for c, ty in missing)
+                cur.execute(f'ALTER TABLE sieve.{t} {adds}')
+                log.info('added %d column(s) to sieve.%s: %s', len(missing), t,
+                         ', '.join(c for c, _ in missing))
         log.info('control schema + provenance columns ready')
     finally:
         if own:

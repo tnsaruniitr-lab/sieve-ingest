@@ -65,6 +65,31 @@ def test_quality_gate_rejects_low_confidence_and_incomplete(conn, web, fake_llm,
     assert q1(conn, "SELECT name FROM sieve.rules")[0] == 'good'
 
 
+def test_migration_adds_newer_column_when_older_provenance_exists(conn):
+    """Regression: init_schema must add url_provenance even on a table that
+    ALREADY has superseded_by (the prod state where gating on one sentinel
+    silently skipped the newer column, breaking every rule INSERT)."""
+    from sieve_ingest import db as dbm
+    with conn.cursor() as cur:
+        # Simulate the prod schema: Phase-0 columns present, Phase-3 absent.
+        cur.execute("ALTER TABLE sieve.rules DROP COLUMN IF EXISTS url_provenance")
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_schema='sieve' "
+                    "AND table_name='rules' AND column_name='superseded_by'")
+        assert cur.fetchone(), 'precondition: superseded_by present'
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_schema='sieve' "
+                    "AND table_name='rules' AND column_name='url_provenance'")
+        assert cur.fetchone() is None, 'precondition: url_provenance absent'
+    dbm.init_schema(conn)
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_schema='sieve' "
+                    "AND table_name='rules' AND column_name='url_provenance'")
+        assert cur.fetchone(), 'init_schema added the missing newer column'
+    # And a real insert through upsert_rule now works (would have thrown before).
+    out = dbm.upsert_rule(conn, {'name': 'x', 'if_condition': 'a', 'then_logic': 'b'},
+                          doc_id='1', source_url='https://e.t/x', source_org='T')
+    assert out == 'new'
+
+
 def test_new_rules_carry_extracted_provenance(conn, web, fake_llm):
     add_source(conn)
     web.sitemap['https://example.test/sitemap.xml'] = [
