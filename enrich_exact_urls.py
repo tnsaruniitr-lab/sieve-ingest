@@ -52,7 +52,12 @@ def main():
         for i, ch in enumerate(changes):
             try:
                 counts = extract.ingest_page(conn, ch, s)
-                db.save_url_state(conn, ch.url, s['source_id'], None, None, ch.new_hash)
+                if counts.get('status') == 'failed':
+                    print(f"  [{s['source_id']}] {i+1}/{len(changes)} extraction FAILED "
+                          f"{ch.url} — not consuming, will retry", flush=True)
+                    continue
+                db.save_url_state(conn, ch.url, s['source_id'], ch.etag, ch.lastmod,
+                                  ch.new_hash)
             except Exception as e:
                 print(f"  [{s['source_id']}] {i+1}/{len(changes)} FAILED {ch.url}: {e}", flush=True)
                 continue
