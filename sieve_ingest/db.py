@@ -114,7 +114,8 @@ def init_schema(conn=None) -> None:
                         "ADD COLUMN IF NOT EXISTS url_filter text, "
                         "ADD COLUMN IF NOT EXISTS consecutive_failures int NOT NULL DEFAULT 0, "
                         "ADD COLUMN IF NOT EXISTS last_ok_at timestamptz, "
-                        "ADD COLUMN IF NOT EXISTS last_error text")
+                        "ADD COLUMN IF NOT EXISTS last_error text, "
+                        "ADD COLUMN IF NOT EXISTS crawl_cursor jsonb")
             # Sequence-based ids for brain inserts: MAX(id)+1 races when the CLI
             # and the cron run concurrently. Guarded setval never rewinds.
             for t in ('rules', 'documents'):
@@ -208,6 +209,35 @@ def mark_source_crawled(conn, source_id: str, marker: Optional[str]) -> None:
         cur.execute("UPDATE sieve.source_registry SET last_crawled_at=now(), "
                     "last_seen_marker=COALESCE(%s, last_seen_marker) WHERE source_id=%s",
                     (marker, source_id))
+
+
+def get_crawl_cursor(conn, source_id: str) -> Dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT crawl_cursor FROM sieve.source_registry WHERE source_id=%s",
+                    (source_id,))
+        row = cur.fetchone()
+        return (row[0] or {}) if row else {}
+
+
+def save_crawl_cursor(conn, source_id: str, cursor: Dict[str, Any]) -> None:
+    from psycopg2.extras import Json
+    with conn.cursor() as cur:
+        cur.execute("UPDATE sieve.source_registry SET crawl_cursor=%s WHERE source_id=%s",
+                    (Json(cursor), source_id))
+
+
+def pending_retry_urls(conn, source_id: str, limit: int = 20) -> List[str]:
+    """URLs whose most recent change is still 'failed' (extraction never
+    succeeded, change never consumed). The rotation cursor must re-probe these
+    FIRST or they'd be stranded until the window wraps back around."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT ON (url) url, extract_status
+            FROM sieve.ingest_changes
+            WHERE source_id=%s
+            ORDER BY url, change_id DESC
+        """, (source_id,))
+        return [u for u, st in cur.fetchall() if st == 'failed'][:limit]
 
 
 def update_source_health(conn, source_id: str, ok: bool, error: Optional[str] = None) -> int:

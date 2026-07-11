@@ -38,6 +38,39 @@ log = logging.getLogger('ingest.agent')
 MAX_URLS_PER_SOURCE = int(os.getenv('MAX_URLS_PER_SOURCE', '15'))
 GAVE_UP_AFTER = int(os.getenv('GAVE_UP_AFTER', '3'))
 
+# Observability (all optional, all best-effort — a broken alert never breaks a run):
+#   HEALTHCHECK_PING_URL  dead-man's switch (e.g. healthchecks.io): pinged on
+#                         success, <url>/fail on partial/failed. A MISSED ping
+#                         is the signal that the cron never ran at all.
+#   ALERT_WEBHOOK_URL     POSTed a JSON digest when a run isn't clean or any
+#                         source hits a 3+ failure streak.
+HEALTHCHECK_PING_URL = os.getenv('HEALTHCHECK_PING_URL', '')
+ALERT_WEBHOOK_URL = os.getenv('ALERT_WEBHOOK_URL', '')
+
+
+def _notify(summary: dict, outcomes: list) -> None:
+    """Fire the dead-man ping + failure webhook. Never raises."""
+    import httpx
+    ok = summary.get('status') == 'done'
+    streaks = [o for o in outcomes
+               if o.get('consecutive_failures', 0) >= GAVE_UP_AFTER]
+    if HEALTHCHECK_PING_URL:
+        try:
+            url = HEALTHCHECK_PING_URL if ok else HEALTHCHECK_PING_URL.rstrip('/') + '/fail'
+            httpx.get(url, timeout=10)
+        except Exception as e:
+            log.warning('healthcheck ping failed: %s', e)
+    if ALERT_WEBHOOK_URL and (not ok or streaks):
+        try:
+            httpx.post(ALERT_WEBHOOK_URL, timeout=10, json={
+                'service': 'sieve-ingest', 'summary': summary,
+                'failing_streaks': [{'source_id': o['source_id'],
+                                     'consecutive_failures': o['consecutive_failures'],
+                                     'error': o.get('error')} for o in streaks],
+            })
+        except Exception as e:
+            log.warning('alert webhook failed: %s', e)
+
 # extract_page statuses that consume the change (url_state saved).
 _CONSUMED = ('extracted', 'empty', 'irrelevant')
 
@@ -142,6 +175,7 @@ def run_cycle() -> dict:
                    'failed_sources': [o['source_id'] for o in outcomes
                                       if o['status'] != 'ok']}
         log.info('run %s %s: %s', run_id, status, summary)
+        _notify(summary, outcomes)
         return summary
     except Exception as e:
         # A crash must never leave the run stuck 'running' with no trace.
@@ -151,6 +185,7 @@ def run_cycle() -> dict:
                               detail={'error': str(e)[:500]})
             except Exception:
                 log.exception('could not record failed run %s', run_id)
+        _notify({'run_id': run_id, 'status': 'failed', 'error': str(e)[:300]}, [])
         raise
     finally:
         conn.close()

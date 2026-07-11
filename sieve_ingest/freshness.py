@@ -165,8 +165,24 @@ def _detect_changelog(conn, source, client) -> List[ChangedURL]:
                        new_hash=h, text=text)]
 
 
-def _sitemap_urls(client, sitemap_url: str, limit: int = 300) -> List[tuple]:
-    """Return [(loc, lastmod), ...] from a sitemap (follows one index level)."""
+def _sitemap_children(client, sitemap_url: str) -> Optional[List[str]]:
+    """If the sitemap is an INDEX, return its child sitemap URLs; None if it is
+    a direct urlset (or unreadable)."""
+    try:
+        r = client.get(sitemap_url, headers=UA)
+        if r.status_code != 200:
+            return None
+        root = ET.fromstring(r.text)
+        ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+        children = [c.text for c in root.findall('.//sm:sitemap/sm:loc', ns) if c.text]
+        return children or None
+    except Exception as e:
+        log.warning('sitemap index parse failed for %s: %s', sitemap_url, e)
+        return None
+
+
+def _urlset_urls(client, sitemap_url: str, limit: int = 300) -> List[tuple]:
+    """Return [(loc, lastmod), ...] from a single (non-index) sitemap."""
     out = []
     try:
         r = client.get(sitemap_url, headers=UA)
@@ -174,21 +190,32 @@ def _sitemap_urls(client, sitemap_url: str, limit: int = 300) -> List[tuple]:
             return []
         root = ET.fromstring(r.text)
         ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        # sitemap index?
-        children = [c.text for c in root.findall('.//sm:sitemap/sm:loc', ns) if c.text]
-        if children:
-            for child in children[:5]:
-                out.extend(_sitemap_urls(client, child, limit))
-                if len(out) >= limit:
-                    break
-            return out[:limit]
         for u in root.findall('.//sm:url', ns):
             loc = u.find('sm:loc', ns)
             lm = u.find('sm:lastmod', ns)
             if loc is not None and loc.text:
-                out.append((loc.text.strip(), (lm.text.strip() if lm is not None and lm.text else None)))
+                out.append((loc.text.strip(),
+                            (lm.text.strip() if lm is not None and lm.text else None)))
     except Exception as e:
         log.warning('sitemap parse failed for %s: %s', sitemap_url, e)
+    return out[:limit]
+
+
+def _sitemap_urls(client, sitemap_url: str, limit: int = 300,
+                  start_child: int = 0) -> List[tuple]:
+    """[(loc, lastmod), ...] from a sitemap, following one index level starting
+    at child `start_child` (the rotation cursor's window). Kept for callers
+    that don't rotate (probe-source, url-enrichment)."""
+    children = _sitemap_children(client, sitemap_url)
+    if children is None:
+        return _urlset_urls(client, sitemap_url, limit)
+    out: List[tuple] = []
+    n = len(children)
+    for i in range(n):
+        child = children[(start_child + i) % n]
+        out.extend(_urlset_urls(client, child, limit))
+        if len(out) >= limit:
+            break
     return out[:limit]
 
 
@@ -225,15 +252,55 @@ def _probe_url(conn, source, client, loc, lastmod=None):
 
 
 def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedURL]:
-    """Two-stage: sitemap lastmod cheap-filter, then conditional-GET + content-hash.
-    Each changed URL is a specific page, so rules extracted from it get its exact URL."""
+    """Three-stage per cycle, so full coverage accumulates across cycles even on
+    14k-URL sites without ever re-paying for what's known:
+
+      0. RETRY FIRST: URLs with unconsumed failed changes are re-probed before
+         anything else — the rotation cursor must never strand a failed page.
+      1. Window walk: children of a sitemap index are processed starting at the
+         source's crawl_cursor; the cursor advances (and wraps) each cycle.
+      2. Per URL: hygiene filters → lastmod cheap-filter → conditional-GET +
+         content-hash (the definitive signal).
+
+    Each changed URL is a specific page, so its rules get its exact URL."""
     sm = source.get('sitemap_url')
     if not sm:
         return []
     changed: List[ChangedURL] = []
     fetched = 0
     seen: set = set()
-    for raw_loc, lastmod in _sitemap_urls(client, sm):
+
+    # Stage 0 — retry-first: failed-and-unconsumed changes from prior cycles.
+    for loc in db.pending_retry_urls(conn, source['source_id'], limit=max_fetch):
+        loc = normalize_url(loc)
+        if loc in seen:
+            continue
+        seen.add(loc)
+        fetched += 1
+        cu = _probe_url(conn, source, client, loc)
+        if cu:
+            changed.append(cu)
+
+    # Stage 1+2 — cursor-rotated window over the sitemap.
+    children = _sitemap_children(client, sm)
+    cursor = db.get_crawl_cursor(conn, source['source_id'])
+    if children is None:
+        url_iter = _urlset_urls(client, sm)
+        # Direct urlset: rotate by offset so later pages get their turn.
+        off = cursor.get('offset', 0) % max(len(url_iter), 1)
+        url_iter = url_iter[off:] + url_iter[:off]
+        next_cursor = {'offset': (off + max_fetch) % max(len(url_iter), 1)}
+    else:
+        n = len(children)
+        start = cursor.get('child', 0) % n
+        url_iter = []
+        for i in range(n):
+            url_iter.extend(_urlset_urls(client, children[(start + i) % n]))
+            if len(url_iter) >= 300:
+                break
+        next_cursor = {'child': (start + 1) % n}
+
+    for raw_loc, lastmod in url_iter:
         loc = normalize_url(raw_loc)
         # Hygiene BEFORE any fetch: one page = one probe (?hl=/utm dupes collapse),
         # and denylisted/out-of-scope pages never cost a request or an LLM call.
@@ -241,7 +308,7 @@ def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedUR
             continue
         seen.add(loc)
         prev = db.get_url_state(conn, loc)
-        # Stage 1 — lastmod cheap filter: if we've seen it and lastmod didn't move, skip.
+        # lastmod cheap filter: if we've seen it and lastmod didn't move, skip.
         if prev and lastmod and prev.get('last_modified') == lastmod:
             continue
         if fetched >= max_fetch:
@@ -250,6 +317,7 @@ def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedUR
         cu = _probe_url(conn, source, client, loc, lastmod)
         if cu:
             changed.append(cu)
+    db.save_crawl_cursor(conn, source['source_id'], next_cursor)
     return changed
 
 

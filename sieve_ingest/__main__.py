@@ -164,6 +164,52 @@ def _probe_source(source_id: str):
         conn.close()
 
 
+def _scorecard():
+    """Weekly data-quality scorecard — one screen answering 'is the loop healthy
+    and is the data it writes any good'. Read-only."""
+    conn = db.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT run_id, started_at::date, status, urls_changed, "
+                        "objects_written FROM sieve.ingest_runs ORDER BY run_id DESC LIMIT 5")
+            print('RUNS (last 5):')
+            for r in cur.fetchall():
+                print(f'  #{r[0]} {r[1]} [{r[2]}] urls={r[3]} rules+={r[4]}')
+            cur.execute("""SELECT extract_status, count(*) FROM sieve.ingest_changes
+                           WHERE detected_at >= now()-interval '7 days'
+                           GROUP BY 1 ORDER BY 2 DESC""")
+            rows = cur.fetchall()
+            total = sum(n for _, n in rows) or 1
+            print('\nCHANGES last 7d (spend hygiene):')
+            for st, n in rows:
+                print(f'  {st:11s} {n:4d}  ({100*n//total}%)')
+            cur.execute("""SELECT source_id, consecutive_failures, left(coalesce(last_error,''),50)
+                           FROM sieve.source_registry WHERE consecutive_failures >= 3""")
+            bad = cur.fetchall()
+            print(f'\nALERTING STREAKS (>=3 fails): {len(bad) or "none"}')
+            for sid, cf, err in bad:
+                print(f'  !! {sid} fails={cf} {err}')
+            cur.execute("""SELECT source_org, count(*),
+                                  count(*) FILTER (WHERE source_url IS NOT NULL AND source_url<>'')
+                           FROM sieve.rules WHERE extracted_at >= now()-interval '7 days'
+                           GROUP BY 1 ORDER BY 2 DESC LIMIT 8""")
+            print('\nRULES ADDED last 7d (org | count | with_url):')
+            for org, n, wu in cur.fetchall():
+                print(f'  {str(org):22s} {n:4d} {wu:4d}')
+            try:
+                cur.execute("SELECT count(*), max(last_verified)::date, "
+                            "count(*) FILTER (WHERE embedding IS NOT NULL) FROM sieve.rules")
+                n, mv, emb = cur.fetchone()
+                print(f'\nCORPUS: {n} rules | verified through {mv} | embedded {emb} '
+                      f'({100*emb//max(n,1)}%)')
+            except Exception:  # no embedding column (pre-vector DB)
+                cur.execute("SELECT count(*), max(last_verified)::date FROM sieve.rules")
+                n, mv = cur.fetchone()
+                print(f'\nCORPUS: {n} rules | verified through {mv} | embeddings n/a')
+    finally:
+        conn.close()
+
+
 def _health():
     conn = db.connect()
     try:
@@ -227,6 +273,8 @@ def main():
         _migrate_url_state()
     elif cmd == 'health':
         _health()
+    elif cmd == 'scorecard':
+        _scorecard()
     elif cmd == 'set-source' and len(sys.argv) > 3:
         _set_source(sys.argv[2], sys.argv[3:])
     elif cmd == 'enable' and len(sys.argv) > 2:
