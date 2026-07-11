@@ -9,6 +9,7 @@
     python -m sieve_ingest migrate-url-state  # one-time: re-key url_state through normalize_url
 
   Operator commands (no code deploy needed — insert-only seed never reverts them):
+    python -m sieve_ingest add-source <id> canonical_org=.. root_url=.. [adapter_type=.. ...]
     python -m sieve_ingest set-source <id> <field>=<value> [...]   # fix a row in place
     python -m sieve_ingest enable <id> | disable <id>
     python -m sieve_ingest probe-source <id>   # dry-run pre-flight: NO db writes, no LLM
@@ -91,6 +92,51 @@ def _set_source(source_id: str, pairs):
             if not cur.fetchone():
                 print(f'no such source {source_id!r}'); sys.exit(1)
         print(f'{source_id}: set {", ".join(updates)}')
+    finally:
+        conn.close()
+
+
+def _add_source(source_id: str, pairs):
+    """add-source <id> canonical_org=.. root_url=.. [adapter_type=.. tier=..
+    sitemap_url=.. seed_urls='[..]' url_filter=.. crawl_cadence_days=..]
+
+    Registers a BRAND-NEW source so the next cron cycle crawls it — no code
+    deploy. Inserted disabled=false won't happen; it lands ENABLED and due
+    immediately (last_crawled_at NULL). Run `probe-source <id>` right after to
+    confirm it actually yields pages before the cron spends LLM budget."""
+    import json as _json
+    row = {'source_id': source_id, 'adapter_type': 'sitemap', 'tier': 3,
+           'crawl_cadence_days': 30, 'enabled': True}
+    for p in pairs:
+        if '=' not in p:
+            print(f'bad assignment {p!r} — use field=value'); sys.exit(1)
+        k, v = p.split('=', 1)
+        if k == 'seed_urls':
+            row[k] = _json.loads(v)
+        elif k in _SETTABLE:
+            row[k] = (None if v in ('', 'null', 'NULL') else v)
+        else:
+            print(f'unknown field {k!r}; allowed: {sorted(_SETTABLE | {"seed_urls"})}')
+            sys.exit(1)
+    if not row.get('canonical_org') or not row.get('root_url'):
+        print('add-source needs at least canonical_org=.. and root_url=..'); sys.exit(1)
+    if 'tier' in row and row['tier'] is not None:
+        row['tier'] = int(row['tier'])
+    if 'crawl_cadence_days' in row:
+        row['crawl_cadence_days'] = int(row['crawl_cadence_days'])
+    conn = db.connect()
+    try:
+        db.init_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM sieve.source_registry WHERE source_id=%s", (source_id,))
+            if cur.fetchone():
+                print(f'{source_id!r} already exists — use set-source to edit it'); sys.exit(1)
+        # force=True path is the INSERT (insert-only default would still insert a
+        # new id; force just also syncs on conflict, which we've excluded above).
+        db.upsert_source(conn, row, force=True)
+        print(f'added {source_id} (adapter={row["adapter_type"]}, tier={row.get("tier",3)}, '
+              f'enabled) — run `probe-source {source_id}` to pre-flight it, then it '
+              f'crawls on the next cycle.')
     finally:
         conn.close()
 
@@ -275,6 +321,8 @@ def main():
         _health()
     elif cmd == 'scorecard':
         _scorecard()
+    elif cmd == 'add-source' and len(sys.argv) > 3:
+        _add_source(sys.argv[2], sys.argv[3:])
     elif cmd == 'set-source' and len(sys.argv) > 3:
         _set_source(sys.argv[2], sys.argv[3:])
     elif cmd == 'enable' and len(sys.argv) > 2:

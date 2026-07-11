@@ -99,6 +99,31 @@ def test_set_source_rejects_unknown_field(conn):
     assert r.returncode == 1 and 'unknown field' in r.stdout
 
 
+def test_add_source_registers_new_and_becomes_due(conn):
+    from sieve_ingest import db as dbm
+    r = _cli('add-source', 'my-blog', 'canonical_org=MyBlog',
+             'root_url=https://myblog.test', 'adapter_type=sitemap',
+             'sitemap_url=https://myblog.test/sitemap.xml', 'tier=2',
+             'url_filter=^/posts/')
+    assert r.returncode == 0, r.stderr + r.stdout
+    row = q1(conn, "SELECT canonical_org, adapter_type, tier, url_filter, enabled, "
+                   "last_crawled_at FROM sieve.source_registry WHERE source_id='my-blog'")
+    assert row == ('MyBlog', 'sitemap', 2, '^/posts/', True, None)
+    # NULL last_crawled_at → immediately due for the next cycle.
+    assert 'my-blog' in [s['source_id'] for s in dbm.due_sources(conn)]
+
+
+def test_add_source_requires_org_and_root_url(conn):
+    r = _cli('add-source', 'incomplete', 'tier=1')
+    assert r.returncode == 1 and 'needs at least' in r.stdout
+
+
+def test_add_source_rejects_duplicate(conn):
+    add_source(conn, source_id='dup')
+    r = _cli('add-source', 'dup', 'canonical_org=X', 'root_url=https://x.test')
+    assert r.returncode == 1 and 'already exists' in r.stdout
+
+
 def test_health_command_output(conn, web, fake_llm, monkeypatch):
     from sieve_ingest import freshness
     add_source(conn)
