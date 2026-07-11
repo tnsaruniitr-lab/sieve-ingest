@@ -70,9 +70,10 @@ SEED_SOURCES = [
          adapter_type='sitemap', crawl_cadence_days=30,
          root_url='https://developer.mozilla.org',
          sitemap_url='https://developer.mozilla.org/sitemap.xml',
-         url_filter=r'^/en-US/docs/',
-         notes='url_filter blocks site chrome (/about, /advertising, 404 — all '
-               'ingested by the Jul-6 run) and non-English locales.'),
+         url_filter=r'^/en-US/docs/(Web/(HTML|HTTP|Performance|Accessibility|Media)|Glossary)\b',
+         notes='url_filter limits the 14k-page docs tree to SEO-relevant trees '
+               '(the Jul-11 backfill extracted game-dev "rules" at tier-1) and '
+               'blocks chrome/locales.'),
     dict(source_id='perplexity-docs', canonical_org='Perplexity', tier=1,
          adapter_type='url_list', crawl_cadence_days=14,
          root_url='https://docs.perplexity.ai',
@@ -92,7 +93,12 @@ SEED_SOURCES = [
     # ---- Tier 2: respected secondary (monthly) ----
     dict(source_id='backlinko', canonical_org='Backlinko', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://backlinko.com', sitemap_url='https://backlinko.com/sitemap.xml'),
+         root_url='https://backlinko.com', sitemap_url='https://backlinko.com/sitemap.xml',
+         url_filter=r'seo|keyword|link|serp|rank|search|google|backlink|content'
+                    r'|speed|schema|snippet|traffic|crawl',
+         notes='flat-slug blog; allowlist keeps SEO posts, drops the email/'
+               'marketing/tool-review long tail (Jul-11: sales-copy, clubhouse, '
+               'email-open-rate each produced 8 "rules").'),
     dict(source_id='ahrefs-blog', canonical_org='Ahrefs', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
          root_url='https://ahrefs.com/blog', sitemap_url='https://ahrefs.com/blog/sitemap.xml'),

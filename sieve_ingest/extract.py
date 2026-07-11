@@ -120,10 +120,15 @@ def ingest_page(conn, changed, source) -> Dict:
     url = changed.url
 
     # Relevance screen for sitemap-discovered pages only — url_list seeds are
-    # curated exact pages and always go to extraction.
-    if source.get('adapter_type') == 'sitemap' and not _RELEVANCE_RE.search(text):
-        log.info('  %s — no SEO/AEO signal terms, skipping extraction', url)
-        return {'new': 0, 'refreshed': 0, 'status': 'irrelevant'}
+    # curated exact pages and always go to extraction. TWO distinct signal terms
+    # required: one leaks badly (MDN game-dev docs matched on 'indexing',
+    # marketing posts on a lone 'seo' — 120 junk rules in the Jul-11 backfill).
+    if source.get('adapter_type') == 'sitemap':
+        hits = {m.group(0).lower() for m in _RELEVANCE_RE.finditer(text)}
+        if len(hits) < 2:
+            log.info('  %s — %d SEO/AEO signal term(s), skipping extraction',
+                     url, len(hits))
+            return {'new': 0, 'refreshed': 0, 'status': 'irrelevant'}
 
     try:
         rules = _extract_rules(text, org, url)

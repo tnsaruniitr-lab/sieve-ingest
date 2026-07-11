@@ -168,6 +168,25 @@ def test_relevance_screen_skips_llm_for_offtopic_pages(conn, web, fake_llm):
     assert summary['status'] == 'done'
 
 
+def test_relevance_screen_needs_two_distinct_terms(conn, web, fake_llm):
+    """One leaked term must not pass (game-dev docs matched a lone 'indexing'
+    in the Jul-11 backfill; marketing posts a lone 'SEO')."""
+    add_source(conn)
+    web.sitemap['https://example.test/sitemap.xml'] = [
+        ('https://example.test/tilemaps', None),
+        ('https://example.test/newsletter-tips', None)]
+    web.pages['https://example.test/tilemaps'] = (
+        '<html><body><main><p>Square tilemaps: indexing into the tile array is '
+        'fast. Indexing again and again for game maps.</p></main></body></html>')
+    web.pages['https://example.test/newsletter-tips'] = (
+        '<html><body><main><p>Write better newsletters. A dash of SEO helps '
+        'your archive pages.</p></main></body></html>')
+    _cycle()
+    assert fake_llm['calls'] == 0, 'single-term pages must not reach the LLM'
+    assert [r for (r,) in _all(conn, "SELECT extract_status FROM sieve.ingest_changes")] \
+        == ['irrelevant', 'irrelevant']
+
+
 def test_url_filter_allowlist(conn, web, fake_llm):
     add_source(conn, url_filter=r'^/docs/')
     web.sitemap['https://example.test/sitemap.xml'] = [
