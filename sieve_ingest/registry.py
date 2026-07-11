@@ -59,14 +59,20 @@ SEED_SOURCES = [
     dict(source_id='web-dev', canonical_org='web.dev', tier=1,
          adapter_type='sitemap', crawl_cadence_days=14,
          root_url='https://web.dev',
-         sitemap_url='https://web.dev/sitemap.xml', notes='Core Web Vitals / performance.'),
+         sitemap_url='https://web.dev/sitemap.xml',
+         url_filter=r'^/(articles|learn|blog)/',
+         notes='Core Web Vitals / performance. url_filter keeps the crawl on '
+               'content paths (the Jul-6 run burned budget on locale dupes).'),
     dict(source_id='w3c', canonical_org='W3C', tier=1,
          adapter_type='sitemap', crawl_cadence_days=30,
          root_url='https://www.w3.org/TR/', sitemap_url=None),
     dict(source_id='mdn', canonical_org='MDN', tier=1,
          adapter_type='sitemap', crawl_cadence_days=30,
          root_url='https://developer.mozilla.org',
-         sitemap_url='https://developer.mozilla.org/sitemap.xml'),
+         sitemap_url='https://developer.mozilla.org/sitemap.xml',
+         url_filter=r'^/en-US/docs/',
+         notes='url_filter blocks site chrome (/about, /advertising, 404 — all '
+               'ingested by the Jul-6 run) and non-English locales.'),
     dict(source_id='perplexity-docs', canonical_org='Perplexity', tier=1,
          adapter_type='url_list', crawl_cadence_days=14,
          root_url='https://docs.perplexity.ai',
@@ -102,13 +108,17 @@ SEED_SOURCES = [
 ]
 
 
-def seed(conn=None) -> int:
+def seed(conn=None, force: bool = False) -> int:
+    """Insert-only by default: fills missing sources, never touches existing rows
+    (operator DB fixes survive the every-cycle re-seed). `force=True` is the
+    deliberate code→DB sync (run `python -m sieve_ingest seed --force` once after
+    changing SEED_SOURCES); it still never overwrites `enabled`."""
     own = conn is None
     conn = conn or db.connect()
     try:
         db.init_schema(conn)
         for s in SEED_SOURCES:
-            db.upsert_source(conn, s)
+            db.upsert_source(conn, s, force=force)
         return len(SEED_SOURCES)
     finally:
         if own:

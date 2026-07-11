@@ -42,10 +42,66 @@ class ChangedURL:
     old_hash: Optional[str] = None
     new_hash: Optional[str] = None
     text: str = ''            # fetched main text (populated when we fetched it)
+    etag: Optional[str] = None       # response ETag — persisted so conditional GETs work next cycle
+    lastmod: Optional[str] = None    # sitemap lastmod — persisted for the stage-1 cheap filter
 
 
 def _norm_hash(text: str) -> str:
     return hashlib.sha256(re.sub(r'\s+', ' ', text or '').strip().encode()).hexdigest()
+
+
+# Tracking/duplicate query params that fan one page out into many URLs
+# (the Jul-6 run burned web.dev's whole budget on one article ×5 ?hl= locales).
+# Deliberately NOT 'ref'/'source' — those can be semantic on doc sites.
+_JUNK_PARAMS = re.compile(r'^(hl|utm_[a-z]+|gclid|fbclid)$', re.I)
+
+# Hard denylist — never worth a fetch or an LLM call. Ported from sieve-crawler's
+# proven filter checklist + the exact page types the Jul-6 run ingested (404,
+# /about, /advertising, site chrome).
+#   - Chrome words are anchored to the path ROOT (at most one locale/prefix
+#     segment before them): /about and /en-US/about are chrome; deep doc paths
+#     like /en-US/docs/Web/Privacy or /docs/authentication are CONTENT.
+#   - 'search' is deliberately NOT in the list — developers.google.com/search/*
+#     is core content; query-based search pages are caught by _DENY_QUERY.
+_DENY_ROOT = re.compile(
+    r'^(?:/[^/]+)?/(?:login|signin|signup|register|account|dashboard|auth'
+    r'|404|about|advertising|careers|jobs|privacy|terms|legal|contact'
+    r'|newsletter)(?:[/?#]|$)', re.I)
+_DENY_PATH = re.compile(
+    r'\.(?:pdf|jpg|jpeg|png|gif|svg|webp|mp4|mp3|zip|tar|gz|css|js)$'
+    r'|/page/\d|/tags?/|/tags?$|/category/|/feed/?$|/rss/?$|\.atom$', re.I)
+_DENY_QUERY = re.compile(r'(?:^|&)(?:q|search)=|(?:^|&)page=\d', re.I)
+
+
+def normalize_url(url: str) -> str:
+    """Canonical form for fingerprinting: strip fragment + junk params, collapse
+    the trailing slash. One page = one url_state row, whatever locale/utm noise
+    the sitemap decorates it with."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    parts = urlsplit(url.strip())
+    q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+         if not _JUNK_PARAMS.match(k)]
+    path = parts.path.rstrip('/') or '/'
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(q), ''))
+
+
+def url_allowed(source, url: str) -> bool:
+    """Global denylist + optional per-source allow-regex (matched against the
+    URL path). Applied BEFORE any fetch/LLM spend."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if (_DENY_ROOT.search(parts.path) or _DENY_PATH.search(parts.path)
+            or _DENY_QUERY.search(parts.query)):
+        return False
+    allow = source.get('url_filter')
+    if allow:
+        try:
+            if not re.search(allow, parts.path):
+                return False
+        except re.error:
+            log.warning('%s has invalid url_filter %r — ignoring it',
+                        source.get('source_id'), allow)
+    return True
 
 
 def _main_text(html: str) -> str:
@@ -66,22 +122,28 @@ def _main_text(html: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _detect_github_release(conn, source, client) -> List[ChangedURL]:
-    """Schema.org etc.: latest release tag via the GitHub API."""
+    """Schema.org etc.: latest release tag via the GitHub API. The release NOTES
+    body rides along as the extraction text — without it every release would be
+    consumed as 'empty' and the brain would never learn what changed."""
     m = re.search(r'github\.com/([^/]+)/([^/]+)', source.get('sitemap_url') or source['root_url'])
     if not m:
         return []
     api = f'https://api.github.com/repos/{m.group(1)}/{m.group(2)}/releases/latest'
     try:
         r = client.get(api, headers={**UA, 'Accept': 'application/vnd.github+json'})
-        tag = r.json().get('tag_name') if r.status_code == 200 else None
+        rel = r.json() if r.status_code == 200 else {}
+        tag = rel.get('tag_name')
     except Exception as e:
         log.warning('%s github check failed: %s', source['source_id'], e); return []
     if not tag:
         return []
     if tag == source.get('last_seen_marker'):
         return []  # no new release → nothing changed
-    return [ChangedURL(url=source['root_url'], change_type='modified', signal='version',
-                       old_hash=source.get('last_seen_marker'), new_hash=tag)]
+    notes = f"{rel.get('name') or tag}\n\n{rel.get('body') or ''}".strip()
+    url = rel.get('html_url') or source['root_url']  # exact release page, not the hub
+    return [ChangedURL(url=url, change_type='modified', signal='version',
+                       old_hash=source.get('last_seen_marker'), new_hash=tag,
+                       text=notes)]
 
 
 def _detect_changelog(conn, source, client) -> List[ChangedURL]:
@@ -159,7 +221,7 @@ def _probe_url(conn, source, client, loc, lastmod=None):
         return None
     return ChangedURL(url=loc, change_type=('new' if not prev else 'modified'),
                       signal='content_hash', old_hash=(prev or {}).get('content_hash'),
-                      new_hash=h, text=text)
+                      new_hash=h, text=text, etag=etag, lastmod=lastmod)
 
 
 def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedURL]:
@@ -170,7 +232,14 @@ def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedUR
         return []
     changed: List[ChangedURL] = []
     fetched = 0
-    for loc, lastmod in _sitemap_urls(client, sm):
+    seen: set = set()
+    for raw_loc, lastmod in _sitemap_urls(client, sm):
+        loc = normalize_url(raw_loc)
+        # Hygiene BEFORE any fetch: one page = one probe (?hl=/utm dupes collapse),
+        # and denylisted/out-of-scope pages never cost a request or an LLM call.
+        if loc in seen or not url_allowed(source, loc):
+            continue
+        seen.add(loc)
         prev = db.get_url_state(conn, loc)
         # Stage 1 — lastmod cheap filter: if we've seen it and lastmod didn't move, skip.
         if prev and lastmod and prev.get('last_modified') == lastmod:
@@ -196,9 +265,14 @@ def _detect_url_list(conn, source, client, max_fetch: int = 60) -> List[ChangedU
         except Exception:
             urls = [u.strip() for u in urls.split(',') if u.strip()]
     changed: List[ChangedURL] = []
-    for i, loc in enumerate(urls):
-        if i >= max_fetch:
+    seen: set = set()
+    for loc in urls:
+        if len(seen) >= max_fetch:
             break
+        loc = normalize_url(loc)
+        if loc in seen:  # seed_urls are curated — denylist does not apply here
+            continue
+        seen.add(loc)
         cu = _probe_url(conn, source, client, loc)
         if cu:
             changed.append(cu)
