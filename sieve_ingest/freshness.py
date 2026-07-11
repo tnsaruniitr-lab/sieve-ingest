@@ -37,8 +37,8 @@ UA = {'User-Agent': 'sieve-ingest/1.0 (+freshness-bot)'}
 @dataclass
 class ChangedURL:
     url: str
-    change_type: str          # new | modified
-    signal: str               # lastmod | etag | content_hash | version
+    change_type: str          # new | modified | removed
+    signal: str               # lastmod | etag | content_hash | version | gone
     old_hash: Optional[str] = None
     new_hash: Optional[str] = None
     text: str = ''            # fetched main text (populated when we fetched it)
@@ -238,6 +238,11 @@ def _probe_url(conn, source, client, loc, lastmod=None):
         db.save_url_state(conn, loc, source['source_id'], prev.get('etag'),
                           lastmod or (prev or {}).get('last_modified'), prev.get('content_hash'))
         return None
+    if r.status_code in (404, 410) and prev:
+        # A page we HAD fingerprinted is gone — the retire signal. Rules that
+        # cite it must stop being served as current guidance.
+        return ChangedURL(url=loc, change_type='removed', signal='gone',
+                          old_hash=prev.get('content_hash'), new_hash=None)
     if r.status_code != 200:
         return None
     text = _main_text(r.text)

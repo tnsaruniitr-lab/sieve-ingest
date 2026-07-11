@@ -146,7 +146,8 @@ def init_schema(conn=None) -> None:
                         ADD COLUMN IF NOT EXISTS extracted_at timestamptz,
                         ADD COLUMN IF NOT EXISTS last_verified timestamptz,
                         ADD COLUMN IF NOT EXISTS rule_key text,
-                        ADD COLUMN IF NOT EXISTS superseded_by text
+                        ADD COLUMN IF NOT EXISTS superseded_by text,
+                        ADD COLUMN IF NOT EXISTS url_provenance text
                 """)
         log.info('control schema + provenance columns ready')
     finally:
@@ -369,6 +370,19 @@ def upsert_document(conn, source_url, source_org, title, domain_tag) -> str:
         return new_id
 
 
+def retire_rules_for_url(conn, source_url: str) -> int:
+    """The page a rule was extracted from is gone (404/410) — retire its rules.
+    Never deletes: status='retired' keeps the record; the auditor's retrieval
+    filters on status so retired guidance is unciteable. Re-extraction of a
+    matching rule_key reactivates (see upsert_rule)."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE sieve.rules SET status='retired' "
+                    "WHERE source_url=%s AND status='active'", (source_url,))
+        n = cur.rowcount
+        cur.execute("DELETE FROM sieve.url_state WHERE url=%s", (source_url,))
+        return n
+
+
 def _rule_key(name: str, if_cond: str) -> str:
     return 'rk_' + hashlib.sha256(f'{(name or "").strip().lower()}|{(if_cond or "").strip().lower()}'
                                   .encode()).hexdigest()[:20]
@@ -384,9 +398,10 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
         cur.execute("SELECT id FROM sieve.rules WHERE rule_key=%s LIMIT 1", (key,))
         existing = cur.fetchone()
         if existing:
-            # Refresh last_verified; and BACKFILL/UPGRADE source_url when the new
-            # page is more specific (more path depth) or the existing has none.
-            # Never blanks an existing URL — only improves it. No data lost.
+            # Refresh last_verified (+ REACTIVATE if it was retired — the source
+            # page proving it is live again); BACKFILL/UPGRADE source_url when
+            # the new page is more specific (more path depth) or the existing
+            # has none. Never blanks an existing URL — only improves it.
             cur.execute("SELECT source_url FROM sieve.rules WHERE rule_key=%s", (key,))
             cur_url = (cur.fetchone()[0] or '')
             more_specific = bool(source_url) and (
@@ -394,10 +409,12 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
                 source_url.rstrip('/').count('/') > cur_url.rstrip('/').count('/'))
             if more_specific:
                 cur.execute("UPDATE sieve.rules SET source_url=%s, document_id=%s, "
-                            "last_verified=now() WHERE rule_key=%s",
+                            "url_provenance='extracted', last_verified=now(), "
+                            "status='active' WHERE rule_key=%s",
                             (source_url, doc_id, key))
             else:
-                cur.execute("UPDATE sieve.rules SET last_verified=now() WHERE rule_key=%s", (key,))
+                cur.execute("UPDATE sieve.rules SET last_verified=now(), "
+                            "status='active' WHERE rule_key=%s", (key,))
             return 'refreshed'
         cur.execute("SELECT nextval('sieve.rules_ingest_id_seq')")
         new_id = str(cur.fetchone()[0])
@@ -405,11 +422,57 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
             INSERT INTO sieve.rules
                 (id, name, rule_type, if_condition, then_logic, domain_tag,
                  confidence_score, source_refs_json, status, created_at,
-                 source_org, source_url, document_id, extracted_at, last_verified, rule_key)
+                 source_org, source_url, document_id, extracted_at, last_verified,
+                 rule_key, url_provenance)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active', now(),
-                    %s,%s,%s, now(), now(), %s)
+                    %s,%s,%s, now(), now(), %s, 'extracted')
         """, (new_id, rule.get('name'), rule.get('rule_type', 'ingested'),
               rule.get('if_condition'), rule.get('then_logic'), rule.get('domain_tag', 'general'),
               str(rule.get('confidence_score', 0.8)), f'[{doc_id}]',
               source_org, source_url, doc_id, key))
         return 'new'
+
+
+def embed_missing_rules(conn, limit: int = 1000) -> int:
+    """Make freshly-written rules retrievable by the auditor's VECTOR search in
+    the same cycle they land (they are FTS-visible immediately, but invisible
+    to semantic retrieval until embedded). No-ops without OPENAI_API_KEY or a
+    pgvector column. text-embedding-3-small = the auditor's query space."""
+    key = os.getenv('OPENAI_API_KEY')
+    if not key:
+        return 0
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SELECT id, name, if_condition, then_logic FROM sieve.rules "
+                        "WHERE embedding IS NULL AND status='active' "
+                        "ORDER BY extracted_at DESC NULLS LAST LIMIT %s", (limit,))
+        except Exception:
+            return 0  # no embedding column on this DB
+        rows = cur.fetchall()
+    if not rows:
+        return 0
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=key)
+    except Exception as e:
+        log.warning('openai SDK unavailable — embeddings deferred: %s', e)
+        return 0
+    model = os.getenv('EMBED_MODEL', 'text-embedding-3-small')
+    done = 0
+    for i in range(0, len(rows), 200):
+        batch = rows[i:i + 200]
+        texts = [' | '.join(filter(None, (n, c, t)))[:4000] for _, n, c, t in batch]
+        try:
+            resp = client.embeddings.create(model=model, input=texts)
+        except Exception as e:
+            log.warning('embedding batch failed (deferred to next cycle): %s', e)
+            break
+        with conn.cursor() as cur:
+            for (rid, *_), emb in zip(batch, resp.data):
+                vec = '[' + ','.join(f'{x:.7f}' for x in emb.embedding) + ']'
+                cur.execute("UPDATE sieve.rules SET embedding=%s::vector WHERE id=%s",
+                            (vec, rid))
+                done += 1
+    if done:
+        log.info('embedded %d new rules', done)
+    return done

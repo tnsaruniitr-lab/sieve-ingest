@@ -27,6 +27,8 @@ log = logging.getLogger('ingest.extract')
 
 MODEL = os.getenv('INGEST_MODEL', 'claude-sonnet-4-6')
 MAX_RULES_PER_PAGE = int(os.getenv('MAX_RULES_PER_PAGE', '8'))
+MIN_RULE_CONFIDENCE = float(os.getenv('MIN_RULE_CONFIDENCE', '0.6'))
+CHUNK_CHARS = 12000  # per-LLM-call text budget; long docs get a second chunk
 
 
 class ExtractError(Exception):
@@ -84,7 +86,7 @@ def _extract_rules(text: str, org: str, url: str) -> List[Dict]:
     if not key:
         raise ExtractError('ANTHROPIC_API_KEY not set')
     client = Anthropic(api_key=key)
-    prompt = _PROMPT.format(org=org, url=url, maxr=MAX_RULES_PER_PAGE, text=text[:12000])
+    prompt = _PROMPT.format(org=org, url=url, maxr=MAX_RULES_PER_PAGE, text=text)
     try:
         resp = client.messages.create(model=MODEL, max_tokens=2000,
                                        messages=[{'role': 'user', 'content': prompt}])
@@ -103,6 +105,37 @@ def _extract_rules(text: str, org: str, url: str) -> List[Dict]:
     if not all(isinstance(r, dict) for r in rules):
         raise ExtractError('LLM output contains non-object rules')
     return rules
+
+
+def _validate_rules(rules: List[Dict], url: str) -> tuple:
+    """Write-time quality gate: required fields present + numeric confidence
+    above MIN_RULE_CONFIDENCE. Returns (kept, rejected_count) — rejections are
+    counted in the change record, never silently dropped."""
+    kept, rejected = [], 0
+    for r in rules:
+        try:
+            conf = float(r.get('confidence_score', 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        if (r.get('name') and r.get('if_condition') and r.get('then_logic')
+                and conf >= MIN_RULE_CONFIDENCE):
+            r['confidence_score'] = conf
+            kept.append(r)
+        else:
+            rejected += 1
+    if rejected:
+        log.info('  %s — %d rule(s) rejected by quality gate', url, rejected)
+    return kept, rejected
+
+
+def _chunks(text: str) -> List[str]:
+    """Long canonical docs (Google's starter guide) lose everything past the
+    old 12k truncation — split at a paragraph boundary into at most 2 chunks."""
+    if len(text) <= CHUNK_CHARS:
+        return [text]
+    cut = text.rfind('\n', 0, CHUNK_CHARS)
+    cut = cut if cut > CHUNK_CHARS // 2 else CHUNK_CHARS
+    return [text[:cut], text[cut:cut + CHUNK_CHARS]]
 
 
 def ingest_page(conn, changed, source) -> Dict:
@@ -131,17 +164,20 @@ def ingest_page(conn, changed, source) -> Dict:
             return {'new': 0, 'refreshed': 0, 'status': 'irrelevant'}
 
     try:
-        rules = _extract_rules(text, org, url)
+        rules = []
+        for chunk in _chunks(text):
+            rules.extend(_extract_rules(chunk, org, url))
     except ExtractError as e:
         log.warning('  %s extraction failed: %s', url, e)
         return {'new': 0, 'refreshed': 0, 'status': 'failed'}
+    rules, rejected = _validate_rules(rules, url)
     if not rules:
-        return {'new': 0, 'refreshed': 0, 'status': 'empty'}
+        return {'new': 0, 'refreshed': 0, 'status': 'empty', 'rejected': rejected}
 
     doc_id = db.upsert_document(conn, source_url=url, source_org=org,
                                title=(rules[0].get('name') or url)[:200],
                                domain_tag=rules[0].get('domain_tag', 'general'))
-    counts = {'new': 0, 'refreshed': 0, 'status': 'extracted'}
+    counts = {'new': 0, 'refreshed': 0, 'status': 'extracted', 'rejected': rejected}
     write_errors = 0
     for r in rules:
         try:

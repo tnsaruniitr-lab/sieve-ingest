@@ -63,7 +63,10 @@ def main():
             UPDATE sieve.rules t
             SET source_url = nn.source_url,
                 document_id = COALESCE(nn.document_id, t.document_id),
-                last_verified = now()
+                -- HONESTY: this URL comes from an embedding NEIGHBOR, not from
+                -- the page the rule was extracted from. Rank/render accordingly;
+                -- last_verified is deliberately NOT touched (nothing was verified).
+                url_provenance = 'neighbor-inferred'
             FROM sieve.rules src
             CROSS JOIN LATERAL (
                 SELECT r2.source_url, r2.document_id

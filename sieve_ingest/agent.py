@@ -96,6 +96,14 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
         out['changes'] += 1
         change_id = db.record_change(conn, run_id, s['source_id'], ch.url,
                                      ch.change_type, ch.signal, ch.old_hash, ch.new_hash)
+        if ch.change_type == 'removed':
+            # Page is gone — retire its rules (never delete), drop the
+            # fingerprint so a resurrected page re-enters as 'new'.
+            n = db.retire_rules_for_url(conn, ch.url)
+            log.info('  %s GONE — retired %d rule(s)', ch.url, n)
+            db.update_change_outcome(conn, change_id, 'retired', 0, 0)
+            out['retired'] = out.get('retired', 0) + n
+            continue
         try:
             counts = extract.ingest_page(conn, ch, s)
         except Exception as e:
@@ -160,6 +168,14 @@ def run_cycle() -> dict:
 
         outcomes = [_process_source(conn, run_id, s) for s in sources]
 
+        # Same-cycle embeddings: new rules become vector-retrievable before the
+        # auditor's next audit (no-op without OPENAI_API_KEY; failures defer).
+        try:
+            embedded = db.embed_missing_rules(conn)
+        except Exception as e:
+            log.warning('embedding pass failed (deferred): %s', e)
+            embedded = 0
+
         sources_changed = sum(1 for o in outcomes if o['changes'])
         urls_changed = sum(o['changes'] for o in outcomes)
         objects_written = sum(o['rules_new'] for o in outcomes)
@@ -171,7 +187,8 @@ def run_cycle() -> dict:
                       urls_changed=urls_changed, objects_written=objects_written)
         summary = {'run_id': run_id, 'status': status, 'sources_checked': len(sources),
                    'sources_changed': sources_changed, 'urls_changed': urls_changed,
-                   'rules_written': objects_written,
+                   'rules_written': objects_written, 'rules_embedded': embedded,
+                   'rules_retired': sum(o.get('retired', 0) for o in outcomes),
                    'failed_sources': [o['source_id'] for o in outcomes
                                       if o['status'] != 'ok']}
         log.info('run %s %s: %s', run_id, status, summary)
