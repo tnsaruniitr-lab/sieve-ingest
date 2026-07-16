@@ -86,16 +86,29 @@ SEED_SOURCES = [
     dict(source_id='web-dev', canonical_org='web.dev', tier=1,
          adapter_type='sitemap', crawl_cadence_days=14,
          root_url='https://web.dev',
-         sitemap_url='https://web.dev/sitemap.xml', notes='Core Web Vitals / performance.'),
+         sitemap_url='https://web.dev/sitemap.xml',
+         url_filter=r'^/(articles|learn|blog)/',
+         notes='Core Web Vitals / performance. url_filter keeps the crawl on '
+               'content paths (the Jul-6 run burned budget on locale dupes).'),
     dict(source_id='w3c', canonical_org='W3C', tier=1,
-         adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://www.w3.org/TR/', sitemap_url=None, enabled=False,
-         notes='DISABLED 2026-07-16: no sitemap_url → adapter returned [] every '
-               'run while status showed healthy. Re-enable with a real seed list.'),
+         adapter_type='url_list', crawl_cadence_days=30,
+         root_url='https://www.w3.org/TR/',
+         seed_urls=[
+             'https://www.w3.org/TR/WCAG22/',
+             'https://www.w3.org/TR/wai-aria-1.2/',
+             'https://www.w3.org/TR/appmanifest/',
+         ],
+         notes='w3.org has NO sitemap (probed 2026-07-11: /sitemap.xml and '
+               '/TR/sitemap.xml both 404) — url_list of the SEO/AEO-adjacent '
+               'specs instead.'),
     dict(source_id='mdn', canonical_org='MDN', tier=1,
          adapter_type='sitemap', crawl_cadence_days=30,
          root_url='https://developer.mozilla.org',
-         sitemap_url='https://developer.mozilla.org/sitemap.xml'),
+         sitemap_url='https://developer.mozilla.org/sitemap.xml',
+         url_filter=r'^/en-US/docs/(Web/(HTML|HTTP|Performance|Accessibility|Media)|Glossary)\b',
+         notes='url_filter limits the 14k-page docs tree to SEO-relevant trees '
+               '(the Jul-11 backfill extracted game-dev "rules" at tier-1) and '
+               'blocks chrome/locales.'),
     dict(source_id='perplexity-docs', canonical_org='Perplexity', tier=1,
          adapter_type='url_list', crawl_cadence_days=14,
          root_url='https://docs.perplexity.ai',
@@ -119,23 +132,37 @@ SEED_SOURCES = [
     # ---- Tier 2: respected secondary (monthly) ----
     dict(source_id='backlinko', canonical_org='Backlinko', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://backlinko.com', sitemap_url='https://backlinko.com/sitemap.xml'),
+         root_url='https://backlinko.com', sitemap_url='https://backlinko.com/sitemap.xml',
+         url_filter=r'seo|keyword|link|serp|rank|search|google|backlink|content'
+                    r'|speed|schema|snippet|traffic|crawl',
+         notes='flat-slug blog; allowlist keeps SEO posts, drops the email/'
+               'marketing/tool-review long tail (Jul-11: sales-copy, clubhouse, '
+               'email-open-rate each produced 8 "rules").'),
     dict(source_id='ahrefs-blog', canonical_org='Ahrefs', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://ahrefs.com/blog', sitemap_url='https://ahrefs.com/blog/sitemap.xml'),
+         root_url='https://ahrefs.com/blog',
+         sitemap_url='https://ahrefs.com/blog/post-sitemap.xml',
+         notes='post-sitemap.xml is the direct urlset (probed 200, 2026-07-11); '
+               'the old /blog/sitemap.xml 404s.'),
     dict(source_id='semrush-blog', canonical_org='Semrush', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
          root_url='https://www.semrush.com/blog',
-         sitemap_url='https://www.semrush.com/blog/sitemap.xml',
-         notes='sitemap_url fixed 2026-07-16 — was None (adapter yielded nothing).'),
+         sitemap_url='https://www.semrush.com/sitemap.xml',
+         url_filter=r'^/blog/',
+         notes='no blog-only sitemap exists (probed 2026-07-11) — root index + '
+               'url_filter keeps the crawl on /blog/.'),
     dict(source_id='moz-blog', canonical_org='Moz', tier=2,
          adapter_type='sitemap', crawl_cadence_days=30,
-         root_url='https://moz.com/blog', sitemap_url='https://moz.com/blog/sitemap.xml'),
+         root_url='https://moz.com/blog',
+         sitemap_url='https://moz.com/blog-sitemap.xml',
+         notes='blog-sitemap.xml is the direct urlset (probed 200, 2026-07-11); '
+               'the old /blog/sitemap.xml 404s.'),
     dict(source_id='search-engine-land', canonical_org='Search Engine Land', tier=3,
          adapter_type='sitemap', crawl_cadence_days=30,
          root_url='https://searchengineland.com',
          sitemap_url='https://searchengineland.com/sitemap_index.xml',
-         notes='sitemap_url fixed 2026-07-16 — was None (adapter yielded nothing).'),
+         notes='sitemap_index.xml probed 200 2026-07-11; site rate-limits (429) — '
+               'the 20-probe cap keeps us polite.'),
     # ---- Added 2026-07-16: AI-search / GEO evidence layer ----
     dict(source_id='ai-citation-studies', canonical_org='AI Citation Research', tier=2,
          adapter_type='url_list', crawl_cadence_days=30,
@@ -171,13 +198,17 @@ SEED_SOURCES = [
 ]
 
 
-def seed(conn=None) -> int:
+def seed(conn=None, force: bool = False) -> int:
+    """Insert-only by default: fills missing sources, never touches existing rows
+    (operator DB fixes survive the every-cycle re-seed). `force=True` is the
+    deliberate code→DB sync (run `python -m sieve_ingest seed --force` once after
+    changing SEED_SOURCES); it still never overwrites `enabled`."""
     own = conn is None
     conn = conn or db.connect()
     try:
         db.init_schema(conn)
         for s in SEED_SOURCES:
-            db.upsert_source(conn, s)
+            db.upsert_source(conn, s, force=force)
         return len(SEED_SOURCES)
     finally:
         if own:

@@ -4,3 +4,4 @@ trafilatura==1.12.2
 lxml_html_clean==0.4.1
 anthropic==0.84.0
 pypdf==5.1.0
+openai>=1.40

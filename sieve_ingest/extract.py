@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Dict, List, Tuple
 
 from . import db
@@ -31,10 +32,34 @@ log = logging.getLogger('ingest.extract')
 
 MODEL = os.getenv('INGEST_MODEL', 'claude-sonnet-4-6')
 MAX_RULES_PER_PAGE = int(os.getenv('MAX_RULES_PER_PAGE', '8'))
-MAX_EXTRACT_TOKENS = int(os.getenv('MAX_EXTRACT_TOKENS', '4000'))
-MAX_TEXT_CHARS = int(os.getenv('MAX_TEXT_CHARS', '12000'))
+MIN_RULE_CONFIDENCE = float(os.getenv('MIN_RULE_CONFIDENCE', '0.6'))
+CHUNK_CHARS = 12000  # per-LLM-call text budget; long docs get a second chunk
+MAX_EXTRACT_TOKENS = int(os.getenv('MAX_EXTRACT_TOKENS', '4000'))  # 2000 truncated dense pages
 
-VALID_DOMAIN_TAGS = {'seo', 'aeo', 'geo', 'entity', 'content', 'performance', 'general'}
+
+class ExtractError(Exception):
+    """Extraction FAILED (SDK missing, no API key, API error, unparseable LLM
+    output) — as opposed to a genuine 'this page has no rules' empty result.
+    The caller must NOT consume the change (no url_state save) so the same
+    content version is retried next cycle instead of being lost forever."""
+
+
+# Cheap relevance screen for sitemap-discovered pages (curated url_list seeds
+# skip it). The Jul-6 run extracted 39 "rules" from a CSS-masking article and 21
+# from MDN site chrome — a page with none of these terms is not worth a Sonnet
+# call. Deliberately broad (a false PASS costs one LLM call; a false skip loses
+# the page until its content changes), so short tokens are word-bounded and the
+# list errs toward inclusion.
+_RELEVANCE_RE = re.compile(
+    r'seo\b|search engine|search ranking|google search|googlebot|bingbot'
+    r'|crawl|index(?:ing|ation)|structured data|schema\.org|json-ld'
+    r'|sitemap|robots\.txt|meta description|title tag|\bsnippets?\b'
+    r'|canonical|core web vitals|page experience|\blcp\b|\binp\b|\bcls\b'
+    r'|page ?speed|lighthouse|mobile-friendly|ranking|\bserp\b'
+    r'|redirects?\b|rich results?|alt (?:text|attribute)|open graph|\bog:'
+    r'|answer engine|ai overview|featured snippet|knowledge (?:graph|panel)'
+    r'|llms?\.txt|gptbot|ai crawler|citation|e-?e-?a-?t|hreflang|backlink',
+    re.I)
 
 _PROMPT = """You extract atomic, testable SEO/AEO/GEO RULES from documentation text.
 
@@ -58,13 +83,15 @@ TEXT:
 """
 
 
-# ---------------------------------------------------------------------------
-# Robust JSON parsing
-# ---------------------------------------------------------------------------
-
-def _scan_array(raw: str, start: int) -> str | None:
-    """Return the balanced JSON array starting at raw[start], honoring strings
-    and escapes. None if the array never closes (truncated output)."""
+def _salvage_array(raw: str):
+    """Recover a rule array the cheap parse missed: max_tokens can cut the
+    array mid-object, and the greedy regex over-captures when prose follows.
+    Balanced string-aware scan from the first '['; failing that, trim to the
+    last fully-closed '}' and close the array (keeps the complete objects).
+    Returns a list or None — never raises."""
+    start = raw.find('[')
+    if start < 0:
+        return None
     depth = 0
     in_str = False
     esc = False
@@ -85,192 +112,142 @@ def _scan_array(raw: str, start: int) -> str | None:
         elif c in ']}':
             depth -= 1
             if depth == 0:
-                return raw[start:i + 1]
+                try:
+                    v = json.loads(raw[start:i + 1])
+                    return v if isinstance(v, list) else None
+                except Exception:
+                    break
+    last = raw.rfind('}')
+    if last > start:
+        try:
+            v = json.loads(raw[start:last + 1] + ']')
+            return v if isinstance(v, list) else None
+        except Exception:
+            return None
     return None
 
 
-def _salvage_truncated(raw: str, start: int) -> str | None:
-    """max_tokens can cut the array mid-object. Recover the complete objects:
-    trim to the last fully-closed '}' and close the array."""
-    last_obj_end = raw.rfind('}')
-    if last_obj_end <= start:
-        return None
-    return raw[start:last_obj_end + 1] + ']'
-
-
-def _parse_rules(raw: str):
-    """Parse the LLM output into a list of rule dicts.
-    Returns a list on success ([] = the model genuinely said "no rules"),
-    or None when the output was unparseable. Tries, in order: whole-string
-    parse, each balanced array in the text, truncation salvage."""
-    raw = (raw or '').strip()
-    if not raw:
-        return None
-    # 1) the whole response is the array (the common, prompt-compliant case)
-    try:
-        val = json.loads(raw)
-        if isinstance(val, list):
-            return val
-    except Exception:
-        pass
-    # 2) balanced-scan from each '[' — immune to prose before/after and to
-    #    later bracketed asides that broke the old greedy regex. An EMPTY
-    #    array candidate is remembered but scanning continues: a literal []
-    #    in prose/code examples must not shadow the real rules array.
-    saw_empty = False
-    idx = raw.find('[')
-    while idx != -1:
-        candidate = _scan_array(raw, idx)
-        if candidate:
-            try:
-                val = json.loads(candidate)
-                if isinstance(val, list):
-                    if val and isinstance(val[0], dict):
-                        return val
-                    if not val:
-                        saw_empty = True
-            except Exception:
-                pass
-        else:
-            # 3) array never closed → truncated output; salvage complete objects
-            salvaged = _salvage_truncated(raw, idx)
-            if salvaged:
-                try:
-                    val = json.loads(salvaged)
-                    if isinstance(val, list) and val:
-                        log.warning('salvaged %d rules from truncated output', len(val))
-                        return val
-                except Exception:
-                    pass
-        idx = raw.find('[', idx + 1)
-    return [] if saw_empty else None
-
-
-def _valid_rule(r) -> Dict | None:
-    """Schema-validate one extracted rule; normalize in place. None = drop."""
-    if not isinstance(r, dict):
-        return None
-    name = str(r.get('name') or '').strip()
-    if_cond = str(r.get('if_condition') or '').strip()
-    then_logic = str(r.get('then_logic') or '').strip()
-    if not name or not if_cond or not then_logic:
-        return None
-    tag = str(r.get('domain_tag') or 'general').strip().lower()
-    if tag not in VALID_DOMAIN_TAGS:
-        tag = 'general'
-    try:
-        conf = float(r.get('confidence_score', 0.8))
-    except (TypeError, ValueError):
-        conf = 0.8
-    conf = max(0.0, min(1.0, conf))
-    return {'name': name[:300], 'if_condition': if_cond, 'then_logic': then_logic,
-            'domain_tag': tag, 'confidence_score': round(conf, 2)}
-
-
-# ---------------------------------------------------------------------------
-# LLM call
-# ---------------------------------------------------------------------------
-
-def _extract_rules(text: str, org: str, url: str) -> Tuple[List[Dict], str]:
-    """Returns (validated_rules, status). status distinguishes failure classes
-    from a legitimately empty page:
-      ok | empty | no_sdk | no_api_key | llm_error | parse_error | all_invalid
-    """
+def _extract_rules(text: str, org: str, url: str) -> List[Dict]:
+    """Returns the extracted rules ([] = the page genuinely has none).
+    Raises ExtractError on any failure — never masks a failure as 'no rules'."""
     try:
         from anthropic import Anthropic
-    except Exception:
-        log.warning('anthropic SDK unavailable — skipping extraction')
-        return [], 'no_sdk'
+    except Exception as e:
+        raise ExtractError(f'anthropic SDK unavailable: {e}')
     key = os.getenv('ANTHROPIC_API_KEY')
     if not key:
-        log.warning('ANTHROPIC_API_KEY not set — skipping extraction')
-        return [], 'no_api_key'
+        raise ExtractError('ANTHROPIC_API_KEY not set')
     client = Anthropic(api_key=key)
-    prompt = _PROMPT.format(org=org, url=url, maxr=MAX_RULES_PER_PAGE,
-                            text=text[:MAX_TEXT_CHARS])
+    prompt = _PROMPT.format(org=org, url=url, maxr=MAX_RULES_PER_PAGE, text=text)
     try:
         resp = client.messages.create(model=MODEL, max_tokens=MAX_EXTRACT_TOKENS,
                                       messages=[{'role': 'user', 'content': prompt}])
         raw = ''.join(b.text for b in resp.content if getattr(b, 'type', None) == 'text')
     except Exception as e:
-        log.warning('extraction LLM call failed for %s: %s', url, e)
-        return [], 'llm_error'
-
-    parsed = _parse_rules(raw)
-    if parsed is None:
-        log.warning('unparseable extraction output for %s (%d chars)', url, len(raw))
-        return [], 'parse_error'
-    if not parsed:
-        return [], 'empty'
-
-    valid = []
-    for r in parsed[:MAX_RULES_PER_PAGE]:
-        v = _valid_rule(r)
-        if v:
-            valid.append(v)
-    if parsed and not valid:
-        return [], 'all_invalid'
-    if len(valid) < len(parsed[:MAX_RULES_PER_PAGE]):
-        log.warning('dropped %d invalid rule dicts for %s',
-                    len(parsed[:MAX_RULES_PER_PAGE]) - len(valid), url)
-    return valid, 'ok'
+        raise ExtractError(f'LLM call failed: {e}')
+    m = re.search(r'\[.*\]', raw, re.S)
+    if not m:
+        rules = _salvage_array(raw)
+        if rules is None:
+            raise ExtractError('no JSON array in LLM output')
+    else:
+        try:
+            rules = json.loads(m.group(0))
+        except Exception as e:
+            rules = _salvage_array(raw)
+            if rules is None:
+                raise ExtractError(f'unparseable LLM JSON: {e}')
+    if not isinstance(rules, list):
+        raise ExtractError('LLM output is not a list')
+    if not all(isinstance(r, dict) for r in rules):
+        raise ExtractError('LLM output contains non-object rules')
+    return rules
 
 
-# ---------------------------------------------------------------------------
-# Page ingestion
-# ---------------------------------------------------------------------------
+def _validate_rules(rules: List[Dict], url: str) -> tuple:
+    """Write-time quality gate: required fields present + numeric confidence
+    above MIN_RULE_CONFIDENCE. Returns (kept, rejected_count) — rejections are
+    counted in the change record, never silently dropped."""
+    kept, rejected = [], 0
+    for r in rules:
+        try:
+            conf = float(r.get('confidence_score', 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        if (r.get('name') and r.get('if_condition') and r.get('then_logic')
+                and conf >= MIN_RULE_CONFIDENCE):
+            r['confidence_score'] = conf
+            kept.append(r)
+        else:
+            rejected += 1
+    if rejected:
+        log.info('  %s — %d rule(s) rejected by quality gate', url, rejected)
+    return kept, rejected
 
-def _fetch_text(url: str) -> str:
-    """On-demand fetch for adapters that signal change without carrying text
-    (github_release). Best effort; empty string on failure."""
-    try:
-        import httpx
-        from .freshness import UA, _main_text
-        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-            r = client.get(url, headers=UA)
-            if r.status_code == 200:
-                return _main_text(r.text)
-    except Exception as e:
-        log.warning('on-demand fetch failed for %s: %s', url, e)
-    return ''
+
+def _chunks(text: str) -> List[str]:
+    """Long canonical docs (Google's starter guide) lose everything past the
+    old 12k truncation — split at a paragraph boundary into at most 2 chunks."""
+    if len(text) <= CHUNK_CHARS:
+        return [text]
+    cut = text.rfind('\n', 0, CHUNK_CHARS)
+    cut = cut if cut > CHUNK_CHARS // 2 else CHUNK_CHARS
+    return [text[:cut], text[cut:cut + CHUNK_CHARS]]
 
 
 def ingest_page(conn, changed, source) -> Dict:
     """Extract rules from one changed page and write them with provenance.
-    Returns {new, refreshed, dropped, status}."""
+    Returns {new, refreshed, status} where status is:
+        extracted  — LLM ran, rules written (possibly 0 new if all deduped)
+        empty      — nothing to extract (no text, or LLM found no rules)
+        irrelevant — relevance screen skipped the page (no LLM spend)
+        failed     — extraction errored; the change must NOT be consumed
+    """
     text = changed.text
     if not text:  # changelog/github adapters may not carry text; fetch on demand
-        text = _fetch_text(changed.url)
-    if not text:
-        return {'new': 0, 'refreshed': 0, 'dropped': 0, 'status': 'no_text'}
+        return {'new': 0, 'refreshed': 0, 'status': 'empty'}
     org = source['canonical_org']
     url = changed.url
 
-    rules, status = _extract_rules(text, org, url)
-    if not rules:
-        return {'new': 0, 'refreshed': 0, 'dropped': 0, 'status': status}
+    # Relevance screen for sitemap-discovered pages only — url_list seeds are
+    # curated exact pages and always go to extraction. TWO distinct signal terms
+    # required: one leaks badly (MDN game-dev docs matched on 'indexing',
+    # marketing posts on a lone 'seo' — 120 junk rules in the Jul-11 backfill).
+    if source.get('adapter_type') == 'sitemap':
+        hits = {m.group(0).lower() for m in _RELEVANCE_RE.finditer(text)}
+        if len(hits) < 2:
+            log.info('  %s — %d SEO/AEO signal term(s), skipping extraction',
+                     url, len(hits))
+            return {'new': 0, 'refreshed': 0, 'status': 'irrelevant'}
 
-    # Document tag = majority vote across extracted rules (not rules[0]);
-    # title = the page's own <title> when freshness captured it.
-    tag_counts: Dict[str, int] = {}
-    for r in rules:
-        tag_counts[r['domain_tag']] = tag_counts.get(r['domain_tag'], 0) + 1
-    doc_tag = max(tag_counts, key=tag_counts.get)
-    page_title = (getattr(changed, 'title', '') or rules[0]['name'] or url)[:200]
+    try:
+        rules = []
+        for chunk in _chunks(text):
+            rules.extend(_extract_rules(chunk, org, url))
+    except ExtractError as e:
+        log.warning('  %s extraction failed: %s', url, e)
+        return {'new': 0, 'refreshed': 0, 'status': 'failed'}
+    rules, rejected = _validate_rules(rules, url)
+    if not rules:
+        return {'new': 0, 'refreshed': 0, 'status': 'empty', 'rejected': rejected}
 
     doc_id = db.upsert_document(conn, source_url=url, source_org=org,
-                                title=page_title, domain_tag=doc_tag)
-    counts = {'new': 0, 'refreshed': 0, 'dropped': 0, 'status': status}
+                               title=(rules[0].get('name') or url)[:200],
+                               domain_tag=rules[0].get('domain_tag', 'general'))
+    counts = {'new': 0, 'refreshed': 0, 'status': 'extracted', 'rejected': rejected}
+    write_errors = 0
     for r in rules:
         try:
             outcome = db.upsert_rule(conn, r, doc_id=doc_id, source_url=url, source_org=org)
             counts[outcome] = counts.get(outcome, 0) + 1
         except Exception as e:
-            counts['dropped'] += 1
-            log.warning('rule write failed for %s: %s', url, e)
-    if counts['dropped'] and not counts['new'] and not counts['refreshed']:
-        # every write failed → schema drift / DB problem, not a page problem
-        counts['status'] = 'write_error'
-    log.info('  %s → %d new / %d refreshed / %d dropped rules',
-             url, counts['new'], counts['refreshed'], counts['dropped'])
+            write_errors += 1
+            log.warning('rule write failed: %s', e)
+    if write_errors:
+        # Rules were extracted but not all landed — do not consume the change;
+        # the retry re-extracts and upsert_rule dedup makes the replay idempotent.
+        log.warning('  %s: %d/%d rule writes failed — not consuming', url,
+                    write_errors, len(rules))
+        counts['status'] = 'failed'
+    log.info('  %s → %d new / %d refreshed rules', url, counts['new'], counts['refreshed'])
     return counts
