@@ -8,9 +8,14 @@ last_verified instead of duplicating). Each rule carries source_org + source_url
 + document_id + extracted_at + last_verified.
 
 This is the provenance-preserving extraction stage. It is deliberately smaller
-than the full ILD LangGraph (no embeddings here — the auditor's live retrieval
-is FTS today; the vector pass is a separate upgrade), but it keeps the exact
-same brain-object shape so the auditor reads new rules identically.
+than the full ILD LangGraph (no embeddings here — embed_brain.py backfills
+vectors separately), but it keeps the exact same brain-object shape so the
+auditor reads new rules identically.
+
+Hardened (2026-07-16): balanced-bracket JSON parsing (greedy-regex removed),
+truncated-array salvage, per-rule schema validation with confidence clamping,
+and an explicit status channel so a failed extraction is distinguishable from
+a legitimately rule-free page (agent.py records statuses in ingest_runs.detail).
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ import json
 import logging
 import os
 import re
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from . import db
 
@@ -29,6 +34,7 @@ MODEL = os.getenv('INGEST_MODEL', 'claude-sonnet-4-6')
 MAX_RULES_PER_PAGE = int(os.getenv('MAX_RULES_PER_PAGE', '8'))
 MIN_RULE_CONFIDENCE = float(os.getenv('MIN_RULE_CONFIDENCE', '0.6'))
 CHUNK_CHARS = 12000  # per-LLM-call text budget; long docs get a second chunk
+MAX_EXTRACT_TOKENS = int(os.getenv('MAX_EXTRACT_TOKENS', '4000'))  # 2000 truncated dense pages
 
 
 class ExtractError(Exception):
@@ -68,11 +74,57 @@ Return ONLY a JSON array (max {maxr}) of rules, each:
 
 Rules must be concrete and page-checkable (e.g. "Use JSON-LD for structured
 data", "Author needs hasCredential for YMYL"). Skip marketing fluff, opinions,
-and anything not a testable directive. If the text has no real rules, return [].
+and anything not a testable directive. Preserve technical values (bot names,
+thresholds, tag/property names) verbatim from the source. If the text has no
+real rules, return [].
 
 TEXT:
 {text}
 """
+
+
+def _salvage_array(raw: str):
+    """Recover a rule array the cheap parse missed: max_tokens can cut the
+    array mid-object, and the greedy regex over-captures when prose follows.
+    Balanced string-aware scan from the first '['; failing that, trim to the
+    last fully-closed '}' and close the array (keeps the complete objects).
+    Returns a list or None — never raises."""
+    start = raw.find('[')
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c in '[{':
+            depth += 1
+        elif c in ']}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    v = json.loads(raw[start:i + 1])
+                    return v if isinstance(v, list) else None
+                except Exception:
+                    break
+    last = raw.rfind('}')
+    if last > start:
+        try:
+            v = json.loads(raw[start:last + 1] + ']')
+            return v if isinstance(v, list) else None
+        except Exception:
+            return None
+    return None
 
 
 def _extract_rules(text: str, org: str, url: str) -> List[Dict]:
@@ -88,18 +140,23 @@ def _extract_rules(text: str, org: str, url: str) -> List[Dict]:
     client = Anthropic(api_key=key)
     prompt = _PROMPT.format(org=org, url=url, maxr=MAX_RULES_PER_PAGE, text=text)
     try:
-        resp = client.messages.create(model=MODEL, max_tokens=2000,
-                                       messages=[{'role': 'user', 'content': prompt}])
+        resp = client.messages.create(model=MODEL, max_tokens=MAX_EXTRACT_TOKENS,
+                                      messages=[{'role': 'user', 'content': prompt}])
         raw = ''.join(b.text for b in resp.content if getattr(b, 'type', None) == 'text')
     except Exception as e:
         raise ExtractError(f'LLM call failed: {e}')
     m = re.search(r'\[.*\]', raw, re.S)
     if not m:
-        raise ExtractError('no JSON array in LLM output')
-    try:
-        rules = json.loads(m.group(0))
-    except Exception as e:
-        raise ExtractError(f'unparseable LLM JSON: {e}')
+        rules = _salvage_array(raw)
+        if rules is None:
+            raise ExtractError('no JSON array in LLM output')
+    else:
+        try:
+            rules = json.loads(m.group(0))
+        except Exception as e:
+            rules = _salvage_array(raw)
+            if rules is None:
+                raise ExtractError(f'unparseable LLM JSON: {e}')
     if not isinstance(rules, list):
         raise ExtractError('LLM output is not a list')
     if not all(isinstance(r, dict) for r in rules):

@@ -6,6 +6,9 @@
     python -m sieve_ingest status        # show registry + last run
     python -m sieve_ingest changes      # show recent detected changes
     python -m sieve_ingest health       # per-source health: failures, last ok, last error
+    python -m sieve_ingest brain-health # brain coverage metrics + snapshot + drift alerts
+    python -m sieve_ingest critic       # canon-topic completeness probe
+    python -m sieve_ingest observe <f>  # ingest crawl observations (rule_type=observed)
     python -m sieve_ingest migrate-url-state  # one-time: re-key url_state through normalize_url
 
   Operator commands (no code deploy needed — insert-only seed never reverts them):
@@ -310,7 +313,14 @@ def main():
         n = registry.seed(force=force)
         print(f"seeded {n} sources ({'force sync' if force else 'insert-only'})")
     elif cmd == 'run':
-        print(json.dumps(agent.run_cycle(), indent=2))
+        summary = agent.run_cycle()
+        print(json.dumps(summary, indent=2))
+        # Health report rides the same cron so coverage drift is visible weekly.
+        try:
+            from . import health
+            health.report()
+        except Exception as e:
+            logging.getLogger('ingest').warning('health report failed: %s', e)
     elif cmd == 'status':
         _status()
     elif cmd == 'changes':
@@ -319,6 +329,19 @@ def main():
         _migrate_url_state()
     elif cmd == 'health':
         _health()
+    elif cmd == 'brain-health':
+        # Brain-level coverage/drift views (distinct from per-source ops health).
+        from . import health
+        health.report()
+    elif cmd == 'critic':
+        from . import critic
+        critic.run_probe()
+    elif cmd == 'observe':
+        from . import observe
+        if len(sys.argv) < 3:
+            print('usage: python -m sieve_ingest observe <observations.jsonl> [--dry-run]')
+            sys.exit(1)
+        observe.run(sys.argv[2], dry_run='--dry-run' in sys.argv)
     elif cmd == 'scorecard':
         _scorecard()
     elif cmd == 'add-source' and len(sys.argv) > 3:

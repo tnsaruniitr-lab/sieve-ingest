@@ -15,6 +15,7 @@ source_org, source_url, document_id, extracted_at, last_verified.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -142,10 +143,12 @@ def init_schema(conn=None) -> None:
                 'rule_key': 'text', 'superseded_by': 'text',
                 'url_provenance': 'text',
             }
-            for t in ('rules', 'principles', 'anti_patterns'):
+            for t in ('rules', 'principles', 'anti_patterns', 'playbooks'):
                 cur.execute("SELECT column_name FROM information_schema.columns "
                             "WHERE table_schema='sieve' AND table_name=%s", (t,))
                 have = {r[0] for r in cur.fetchall()}
+                if not have:
+                    continue  # table absent on this DB (e.g. playbooks in test fixtures)
                 missing = [(c, ty) for c, ty in _brain_cols.items() if c not in have]
                 if not missing:
                     continue
@@ -393,10 +396,12 @@ def _rule_key(name: str, if_cond: str) -> str:
 
 
 def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
-                source_org: str) -> str:
+                source_org: str, status: str = 'active',
+                url_provenance: Optional[Dict[str, Any]] = None) -> str:
     """Insert a rule, or if a rule with the same rule_key exists, refresh its
     last_verified (proof it's still current) instead of duplicating. Returns
-    'new' | 'refreshed'."""
+    'new' | 'refreshed'. status='candidate' + a custom url_provenance dict is
+    the observed-rule path (crawl-derived knowledge, never authority-tier)."""
     key = _rule_key(rule.get('name', ''), rule.get('if_condition', ''))
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM sieve.rules WHERE rule_key=%s LIMIT 1", (key,))
@@ -405,9 +410,11 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
             # Refresh last_verified (+ REACTIVATE if it was retired — the source
             # page proving it is live again); BACKFILL/UPGRADE source_url when
             # the new page is more specific (more path depth) or the existing
-            # has none. Never blanks an existing URL — only improves it.
-            cur.execute("SELECT source_url FROM sieve.rules WHERE rule_key=%s", (key,))
-            cur_url = (cur.fetchone()[0] or '')
+            # has none; and BACKFILL then_logic if the row somehow has none.
+            # Never blanks an existing URL or action — only improves.
+            cur.execute("SELECT source_url, then_logic FROM sieve.rules WHERE rule_key=%s", (key,))
+            cur_url, cur_then = cur.fetchone()
+            cur_url = cur_url or ''
             more_specific = bool(source_url) and (
                 not cur_url or
                 source_url.rstrip('/').count('/') > cur_url.rstrip('/').count('/'))
@@ -419,21 +426,28 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
             else:
                 cur.execute("UPDATE sieve.rules SET last_verified=now(), "
                             "status='active' WHERE rule_key=%s", (key,))
+            if (not cur_then or not str(cur_then).strip()) and rule.get('then_logic'):
+                cur.execute("UPDATE sieve.rules SET then_logic=%s WHERE rule_key=%s",
+                            (rule.get('then_logic'), key))
             return 'refreshed'
         cur.execute("SELECT nextval('sieve.rules_ingest_id_seq')")
         new_id = str(cur.fetchone()[0])
+        # Default provenance 'extracted' (the page itself carried the rule);
+        # a custom dict (observed-crawl path) is stored as JSON.
+        prov = json.dumps(url_provenance) if url_provenance else 'extracted'
         cur.execute("""
             INSERT INTO sieve.rules
                 (id, name, rule_type, if_condition, then_logic, domain_tag,
                  confidence_score, source_refs_json, status, created_at,
                  source_org, source_url, document_id, extracted_at, last_verified,
                  rule_key, url_provenance)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active', now(),
-                    %s,%s,%s, now(), now(), %s, 'extracted')
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, now(),
+                    %s,%s,%s, now(), now(), %s, %s)
         """, (new_id, rule.get('name'), rule.get('rule_type', 'ingested'),
               rule.get('if_condition'), rule.get('then_logic'), rule.get('domain_tag', 'general'),
-              str(rule.get('confidence_score', 0.8)), f'[{doc_id}]',
-              source_org, source_url, doc_id, key))
+              str(rule.get('confidence_score', 0.8)), f'[{doc_id}]', status,
+              source_org, source_url, doc_id, key,
+              prov))
         return 'new'
 
 

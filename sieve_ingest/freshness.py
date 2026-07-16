@@ -42,8 +42,24 @@ class ChangedURL:
     old_hash: Optional[str] = None
     new_hash: Optional[str] = None
     text: str = ''            # fetched main text (populated when we fetched it)
+    title: str = ''           # page <title> when we fetched HTML (for documents.title)
     etag: Optional[str] = None       # response ETag — persisted so conditional GETs work next cycle
     lastmod: Optional[str] = None    # sitemap lastmod — persisted for the stage-1 cheap filter
+
+
+# Locale-variant URLs pollute the brain with non-English rule text (e.g. the
+# ?hl=zh-TW web.dev leak of 2026-07). Skip anything that is not the canonical
+# English page BEFORE fetch/LLM spend.
+_LOCALE_QUERY = re.compile(r'[?&]hl=(?!en(?:[-_]|$|&))', re.I)
+_LOCALE_PATH = re.compile(
+    r'//developer\.mozilla\.org/(?!en-US/)[a-z]{2}(?:-[A-Za-z]{2,4})?/'
+    r'|//[^/]+/intl/[a-z]{2}'
+    r'|//[^/]+/(?:zh-tw|zh-cn|zh-hans|zh-hant|ja|ko|de|es|fr|pt-br|ru|it|pl|tr|id|vi|th)/',
+    re.I)
+
+
+def _skip_locale(loc: str) -> bool:
+    return bool(_LOCALE_QUERY.search(loc) or _LOCALE_PATH.search(loc))
 
 
 def _norm_hash(text: str) -> str:
@@ -117,6 +133,39 @@ def _main_text(html: str) -> str:
     return re.sub(r'<[^>]+>', ' ', t)
 
 
+def _pdf_text(content: bytes) -> str:
+    """Best-effort text from a PDF response (QRG etc.). Empty string on failure."""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(content))
+        parts = []
+        for page in reader.pages[:40]:  # first 40 pages ≫ the 12k-char LLM window
+            parts.append(page.extract_text() or '')
+            if sum(len(p) for p in parts) > 60000:
+                break
+        return '\n'.join(parts)
+    except Exception as e:
+        log.warning('pdf extraction failed: %s', e)
+        return ''
+
+
+def _page_title(html: str) -> str:
+    m = re.search(r'<title[^>]*>(.*?)</title>', html, re.S | re.I)
+    if not m:
+        return ''
+    t = re.sub(r'\s+', ' ', m.group(1)).strip()
+    return re.split(r'\s*[|–—-]\s{0,2}(?=[A-Z])', t)[0].strip()[:200] or t[:200]
+
+
+def _response_text(r) -> tuple:
+    """(main_text, title) for an HTTP response — HTML via trafilatura, PDF via pypdf."""
+    ctype = (r.headers.get('content-type') or '').lower()
+    if 'pdf' in ctype or r.url.path.lower().endswith('.pdf'):
+        return _pdf_text(r.content), r.url.path.rsplit('/', 1)[-1]
+    return _main_text(r.text), _page_title(r.text)
+
+
 # ---------------------------------------------------------------------------
 # Adapters
 # ---------------------------------------------------------------------------
@@ -188,7 +237,15 @@ def _urlset_urls(client, sitemap_url: str, limit: int = 300) -> List[tuple]:
         r = client.get(sitemap_url, headers=UA)
         if r.status_code != 200:
             return []
-        root = ET.fromstring(r.text)
+        body = r.text
+        # file-level gzip (e.g. developer.mozilla.org sitemap children)
+        if sitemap_url.endswith('.gz') or r.content[:2] == b'\x1f\x8b':
+            import gzip
+            try:
+                body = gzip.decompress(r.content).decode('utf-8', 'replace')
+            except Exception:
+                pass
+        root = ET.fromstring(body)
         ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
         for u in root.findall('.//sm:url', ns):
             loc = u.find('sm:loc', ns)
@@ -224,6 +281,8 @@ def _probe_url(conn, source, client, loc, lastmod=None):
     page is new/changed (so its rules get THIS exact URL), else None. Shared by
     the sitemap and url_list adapters — this is what guarantees per-page (not
     hub) provenance: extraction stamps each rule with `loc`."""
+    if _skip_locale(loc):
+        return None
     prev = db.get_url_state(conn, loc)
     headers = dict(UA)
     if prev and prev.get('etag'):
@@ -245,7 +304,7 @@ def _probe_url(conn, source, client, loc, lastmod=None):
                           old_hash=prev.get('content_hash'), new_hash=None)
     if r.status_code != 200:
         return None
-    text = _main_text(r.text)
+    text, title = _response_text(r)
     h = _norm_hash(text)
     etag = r.headers.get('ETag')
     if prev and prev.get('content_hash') == h:
