@@ -42,6 +42,22 @@ class ChangedURL:
     old_hash: Optional[str] = None
     new_hash: Optional[str] = None
     text: str = ''            # fetched main text (populated when we fetched it)
+    title: str = ''           # page <title> when we fetched HTML (for documents.title)
+
+
+# Locale-variant URLs pollute the brain with non-English rule text (e.g. the
+# ?hl=zh-TW web.dev leak of 2026-07). Skip anything that is not the canonical
+# English page BEFORE fetch/LLM spend.
+_LOCALE_QUERY = re.compile(r'[?&]hl=(?!en(?:[-_]|$|&))', re.I)
+_LOCALE_PATH = re.compile(
+    r'//developer\.mozilla\.org/(?!en-US/)[a-z]{2}(?:-[A-Za-z]{2,4})?/'
+    r'|//[^/]+/intl/[a-z]{2}'
+    r'|//[^/]+/(?:zh-tw|zh-cn|zh-hans|zh-hant|ja|ko|de|es|fr|pt-br|ru|it|pl|tr|id|vi|th)/',
+    re.I)
+
+
+def _skip_locale(loc: str) -> bool:
+    return bool(_LOCALE_QUERY.search(loc) or _LOCALE_PATH.search(loc))
 
 
 def _norm_hash(text: str) -> str:
@@ -59,6 +75,39 @@ def _main_text(html: str) -> str:
     # stdlib fallback: strip tags
     t = re.sub(r'<script.*?</script>|<style.*?</style>', ' ', html, flags=re.S | re.I)
     return re.sub(r'<[^>]+>', ' ', t)
+
+
+def _pdf_text(content: bytes) -> str:
+    """Best-effort text from a PDF response (QRG etc.). Empty string on failure."""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(content))
+        parts = []
+        for page in reader.pages[:40]:  # first 40 pages ≫ the 12k-char LLM window
+            parts.append(page.extract_text() or '')
+            if sum(len(p) for p in parts) > 60000:
+                break
+        return '\n'.join(parts)
+    except Exception as e:
+        log.warning('pdf extraction failed: %s', e)
+        return ''
+
+
+def _page_title(html: str) -> str:
+    m = re.search(r'<title[^>]*>(.*?)</title>', html, re.S | re.I)
+    if not m:
+        return ''
+    t = re.sub(r'\s+', ' ', m.group(1)).strip()
+    return re.split(r'\s*[|–—-]\s{0,2}(?=[A-Z])', t)[0].strip()[:200] or t[:200]
+
+
+def _response_text(r) -> tuple:
+    """(main_text, title) for an HTTP response — HTML via trafilatura, PDF via pypdf."""
+    ctype = (r.headers.get('content-type') or '').lower()
+    if 'pdf' in ctype or r.url.path.lower().endswith('.pdf'):
+        return _pdf_text(r.content), r.url.path.rsplit('/', 1)[-1]
+    return _main_text(r.text), _page_title(r.text)
 
 
 # ---------------------------------------------------------------------------
@@ -104,18 +153,28 @@ def _detect_changelog(conn, source, client) -> List[ChangedURL]:
 
 
 def _sitemap_urls(client, sitemap_url: str, limit: int = 300) -> List[tuple]:
-    """Return [(loc, lastmod), ...] from a sitemap (follows one index level)."""
+    """Return [(loc, lastmod), ...] from a sitemap (follows one index level).
+    Handles gzipped children (MDN-style .xml.gz)."""
     out = []
     try:
         r = client.get(sitemap_url, headers=UA)
         if r.status_code != 200:
             return []
-        root = ET.fromstring(r.text)
+        body = r.text
+        # file-level gzip (e.g. developer.mozilla.org sitemap children)
+        if sitemap_url.endswith('.gz') or r.content[:2] == b'\x1f\x8b':
+            import gzip
+            try:
+                body = gzip.decompress(r.content).decode('utf-8', 'replace')
+            except Exception:
+                pass
+        root = ET.fromstring(body)
         ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        # sitemap index?
+        # sitemap index? Blog indexes (Yoast) list archives oldest-first, so
+        # take the LAST children — that's where current posts live.
         children = [c.text for c in root.findall('.//sm:sitemap/sm:loc', ns) if c.text]
         if children:
-            for child in children[:5]:
+            for child in children[-5:][::-1]:
                 out.extend(_sitemap_urls(client, child, limit))
                 if len(out) >= limit:
                     break
@@ -123,7 +182,7 @@ def _sitemap_urls(client, sitemap_url: str, limit: int = 300) -> List[tuple]:
         for u in root.findall('.//sm:url', ns):
             loc = u.find('sm:loc', ns)
             lm = u.find('sm:lastmod', ns)
-            if loc is not None and loc.text:
+            if loc is not None and loc.text and not _skip_locale(loc.text.strip()):
                 out.append((loc.text.strip(), (lm.text.strip() if lm is not None and lm.text else None)))
     except Exception as e:
         log.warning('sitemap parse failed for %s: %s', sitemap_url, e)
@@ -135,6 +194,8 @@ def _probe_url(conn, source, client, loc, lastmod=None):
     page is new/changed (so its rules get THIS exact URL), else None. Shared by
     the sitemap and url_list adapters — this is what guarantees per-page (not
     hub) provenance: extraction stamps each rule with `loc`."""
+    if _skip_locale(loc):
+        return None
     prev = db.get_url_state(conn, loc)
     headers = dict(UA)
     if prev and prev.get('etag'):
@@ -151,7 +212,7 @@ def _probe_url(conn, source, client, loc, lastmod=None):
         return None
     if r.status_code != 200:
         return None
-    text = _main_text(r.text)
+    text, title = _response_text(r)
     h = _norm_hash(text)
     etag = r.headers.get('ETag')
     if prev and prev.get('content_hash') == h:
@@ -159,25 +220,29 @@ def _probe_url(conn, source, client, loc, lastmod=None):
         return None
     return ChangedURL(url=loc, change_type=('new' if not prev else 'modified'),
                       signal='content_hash', old_hash=(prev or {}).get('content_hash'),
-                      new_hash=h, text=text)
+                      new_hash=h, text=text, title=title)
 
 
-def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedURL]:
+def _detect_sitemap(conn, source, client, max_fetch: int = 20,
+                    max_probe: int = 80) -> List[ChangedURL]:
     """Two-stage: sitemap lastmod cheap-filter, then conditional-GET + content-hash.
-    Each changed URL is a specific page, so rules extracted from it get its exact URL."""
+    Each changed URL is a specific page, so rules extracted from it get its exact
+    URL. `max_fetch` bounds CHANGED pages found (LLM spend); `max_probe` bounds
+    total HTTP probes — without the distinction, sitemaps lacking <lastmod> would
+    burn the whole budget re-probing known-unchanged pages and never advance."""
     sm = source.get('sitemap_url')
     if not sm:
         return []
     changed: List[ChangedURL] = []
-    fetched = 0
+    probed = 0
     for loc, lastmod in _sitemap_urls(client, sm):
         prev = db.get_url_state(conn, loc)
         # Stage 1 — lastmod cheap filter: if we've seen it and lastmod didn't move, skip.
         if prev and lastmod and prev.get('last_modified') == lastmod:
             continue
-        if fetched >= max_fetch:
+        if len(changed) >= max_fetch or probed >= max_probe:
             break
-        fetched += 1
+        probed += 1
         cu = _probe_url(conn, source, client, loc, lastmod)
         if cu:
             changed.append(cu)

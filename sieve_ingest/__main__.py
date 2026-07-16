@@ -1,9 +1,11 @@
 """CLI for the ingestion agent.
 
     python -m sieve_ingest seed     # create schema + seed the source registry
-    python -m sieve_ingest run      # run one ingestion cycle (what Railway cron calls)
+    python -m sieve_ingest run      # one ingestion cycle + health report (Railway cron)
     python -m sieve_ingest status   # show registry + last run
     python -m sieve_ingest changes  # show recent detected changes
+    python -m sieve_ingest health   # brain coverage metrics + snapshot + alerts
+    python -m sieve_ingest critic   # canon-topic completeness probe
 """
 
 from __future__ import annotations
@@ -55,11 +57,30 @@ def main():
     if cmd == 'seed':
         n = registry.seed(); print(f'seeded {n} sources')
     elif cmd == 'run':
-        print(json.dumps(agent.run_cycle(), indent=2))
+        summary = agent.run_cycle()
+        print(json.dumps(summary, indent=2))
+        # Health report rides the same cron so coverage drift is visible weekly.
+        try:
+            from . import health
+            health.report()
+        except Exception as e:
+            logging.getLogger('ingest').warning('health report failed: %s', e)
     elif cmd == 'status':
         _status()
     elif cmd == 'changes':
         _changes()
+    elif cmd == 'health':
+        from . import health
+        health.report()
+    elif cmd == 'critic':
+        from . import critic
+        critic.run_probe()
+    elif cmd == 'observe':
+        from . import observe
+        if len(sys.argv) < 3:
+            print('usage: python -m sieve_ingest observe <observations.jsonl> [--dry-run]')
+            sys.exit(1)
+        observe.run(sys.argv[2], dry_run='--dry-run' in sys.argv)
     else:
         print(__doc__); sys.exit(1)
 

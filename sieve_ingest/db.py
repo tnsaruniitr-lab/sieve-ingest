@@ -15,6 +15,7 @@ source_org, source_url, document_id, extracted_at, last_verified.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -100,7 +101,7 @@ def init_schema(conn=None) -> None:
             cur.execute("ALTER TABLE sieve.source_registry "
                         "ADD COLUMN IF NOT EXISTS seed_urls jsonb")
             # Provenance columns on the brain tables for newly-ingested rows.
-            for t in ('rules', 'principles', 'anti_patterns'):
+            for t in ('rules', 'principles', 'anti_patterns', 'playbooks'):
                 cur.execute(f"""
                     ALTER TABLE sieve.{t}
                         ADD COLUMN IF NOT EXISTS source_url text,
@@ -108,7 +109,8 @@ def init_schema(conn=None) -> None:
                         ADD COLUMN IF NOT EXISTS extracted_at timestamptz,
                         ADD COLUMN IF NOT EXISTS last_verified timestamptz,
                         ADD COLUMN IF NOT EXISTS rule_key text,
-                        ADD COLUMN IF NOT EXISTS superseded_by text
+                        ADD COLUMN IF NOT EXISTS superseded_by text,
+                        ADD COLUMN IF NOT EXISTS url_provenance text
                 """)
         log.info('control schema + provenance columns ready')
     finally:
@@ -136,7 +138,7 @@ def upsert_source(conn, s: Dict[str, Any]) -> None:
             ON CONFLICT (source_id) DO UPDATE SET
                 canonical_org=EXCLUDED.canonical_org, adapter_type=EXCLUDED.adapter_type,
                 tier=EXCLUDED.tier, root_url=EXCLUDED.root_url, sitemap_url=EXCLUDED.sitemap_url,
-                seed_urls=EXCLUDED.seed_urls,
+                seed_urls=EXCLUDED.seed_urls, enabled=EXCLUDED.enabled,
                 crawl_cadence_days=EXCLUDED.crawl_cadence_days, notes=EXCLUDED.notes
         """, params)
 
@@ -205,9 +207,10 @@ def start_run(conn) -> int:
 
 
 def finish_run(conn, run_id, **fields) -> None:
+    fields.setdefault('status', 'done')
     sets = ', '.join(f"{k}=%s" for k in fields)
     with conn.cursor() as cur:
-        cur.execute(f"UPDATE sieve.ingest_runs SET finished_at=now(), status='done', {sets} "
+        cur.execute(f"UPDATE sieve.ingest_runs SET finished_at=now(), {sets} "
                     f"WHERE run_id=%s", (*fields.values(), run_id))
 
 
@@ -240,42 +243,60 @@ def _rule_key(name: str, if_cond: str) -> str:
 
 
 def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
-                source_org: str) -> str:
+                source_org: str, status: str = 'active',
+                url_provenance: Optional[Dict[str, Any]] = None) -> str:
     """Insert a rule, or if a rule with the same rule_key exists, refresh its
     last_verified (proof it's still current) instead of duplicating. Returns
-    'new' | 'refreshed'."""
+    'new' | 'refreshed'. status='candidate' + a custom url_provenance dict is
+    the observed-rule path (crawl-derived knowledge, never authority-tier)."""
     key = _rule_key(rule.get('name', ''), rule.get('if_condition', ''))
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM sieve.rules WHERE rule_key=%s LIMIT 1", (key,))
         existing = cur.fetchone()
         if existing:
-            # Refresh last_verified; and BACKFILL/UPGRADE source_url when the new
-            # page is more specific (more path depth) or the existing has none.
-            # Never blanks an existing URL — only improves it. No data lost.
-            cur.execute("SELECT source_url FROM sieve.rules WHERE rule_key=%s", (key,))
-            cur_url = (cur.fetchone()[0] or '')
+            # Refresh last_verified; BACKFILL/UPGRADE source_url when the new
+            # page is more specific (more path depth) or the existing has none;
+            # and BACKFILL then_logic if the existing row somehow has none.
+            # Never blanks an existing URL or action — only improves. No data lost.
+            cur.execute("SELECT source_url, then_logic FROM sieve.rules WHERE rule_key=%s", (key,))
+            cur_url, cur_then = cur.fetchone()
+            cur_url = cur_url or ''
             more_specific = bool(source_url) and (
                 not cur_url or
                 source_url.rstrip('/').count('/') > cur_url.rstrip('/').count('/'))
             if more_specific:
-                cur.execute("UPDATE sieve.rules SET source_url=%s, document_id=%s, "
-                            "last_verified=now() WHERE rule_key=%s",
-                            (source_url, doc_id, key))
+                cur.execute("""UPDATE sieve.rules SET source_url=%s, document_id=%s,
+                            last_verified=now(),
+                            url_provenance=%s
+                            WHERE rule_key=%s""",
+                            (source_url, doc_id,
+                             json.dumps({'method': 'exact-upgrade', 'at': _now_iso()}), key))
             else:
                 cur.execute("UPDATE sieve.rules SET last_verified=now() WHERE rule_key=%s", (key,))
+            if (not cur_then or not str(cur_then).strip()) and rule.get('then_logic'):
+                cur.execute("UPDATE sieve.rules SET then_logic=%s WHERE rule_key=%s",
+                            (rule.get('then_logic'), key))
             return 'refreshed'
         cur.execute("SELECT COALESCE(MAX(NULLIF(id,'')::bigint),0)+1 FROM sieve.rules "
                     "WHERE id ~ '^[0-9]+$'")
         new_id = str(cur.fetchone()[0])
+        prov = url_provenance or {'method': 'exact', 'at': _now_iso()}
         cur.execute("""
             INSERT INTO sieve.rules
                 (id, name, rule_type, if_condition, then_logic, domain_tag,
                  confidence_score, source_refs_json, status, created_at,
-                 source_org, source_url, document_id, extracted_at, last_verified, rule_key)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active', now(),
-                    %s,%s,%s, now(), now(), %s)
+                 source_org, source_url, document_id, extracted_at, last_verified, rule_key,
+                 url_provenance)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, now(),
+                    %s,%s,%s, now(), now(), %s, %s)
         """, (new_id, rule.get('name'), rule.get('rule_type', 'ingested'),
               rule.get('if_condition'), rule.get('then_logic'), rule.get('domain_tag', 'general'),
-              str(rule.get('confidence_score', 0.8)), f'[{doc_id}]',
-              source_org, source_url, doc_id, key))
+              str(rule.get('confidence_score', 0.8)), f'[{doc_id}]', status,
+              source_org, source_url, doc_id, key,
+              json.dumps(prov)))
         return 'new'
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
