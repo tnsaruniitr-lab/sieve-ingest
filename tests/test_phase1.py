@@ -1,9 +1,15 @@
 """Phase-1 drills: source health ledger, sequence ids, operator CLI."""
 
+import os
 import subprocess
 import sys
 
 from conftest import add_source, q1
+
+# The repo under test — NOT a hardcoded sibling checkout: the CLI drills must
+# exercise this tree's sieve_ingest, or a stale /tmp work repo passes/fails
+# for the wrong code.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SEO_PAGE = ('<html><body><main><p>Structured data and sitemaps help search '
             'engines crawl, index and rank pages.</p></main></body></html>')
@@ -75,7 +81,7 @@ def _all(conn, sql):
 
 def _cli(*args):
     return subprocess.run([sys.executable, '-m', 'sieve_ingest', *args],
-                          capture_output=True, text=True, cwd='/tmp/sieve-ingest-work')
+                          capture_output=True, text=True, cwd=REPO_ROOT)
 
 
 def test_set_source_and_toggle_survive_reseed(conn):

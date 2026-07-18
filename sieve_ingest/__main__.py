@@ -16,6 +16,8 @@
     python -m sieve_ingest set-source <id> <field>=<value> [...]   # fix a row in place
     python -m sieve_ingest enable <id> | disable <id>
     python -m sieve_ingest probe-source <id>   # dry-run pre-flight: NO db writes, no LLM
+    python -m sieve_ingest undeprecate <rule_id|rule_key>  # the ONLY way back from
+                                               # status='deprecated' (upsert never is)
 """
 
 from __future__ import annotations
@@ -153,6 +155,26 @@ def _toggle(source_id: str, enabled: bool):
             if not cur.fetchone():
                 print(f'no such source {source_id!r}'); sys.exit(1)
         print(f'{source_id}: enabled={enabled}')
+    finally:
+        conn.close()
+
+
+def _undeprecate(ident: str):
+    """undeprecate <rule_id|rule_key> — deliberate operator reversal of the
+    one-way deprecation latch (db.upsert_rule NEVER reactivates a deprecated
+    rule, whatever a later extraction claims). Use only after verifying the
+    source genuinely un-deprecated the guidance."""
+    conn = db.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE sieve.rules SET status='active', last_verified=now() "
+                        "WHERE (id=%s OR rule_key=%s) AND status='deprecated' "
+                        "RETURNING id, name", (ident, ident))
+            row = cur.fetchone()
+            if not row:
+                print(f'no deprecated rule matches {ident!r} (id or rule_key)')
+                sys.exit(1)
+        print(f'rule {row[0]} ({row[1]}) reactivated: status=active')
     finally:
         conn.close()
 
@@ -354,6 +376,8 @@ def main():
         _toggle(sys.argv[2], False)
     elif cmd == 'probe-source' and len(sys.argv) > 2:
         _probe_source(sys.argv[2])
+    elif cmd == 'undeprecate' and len(sys.argv) > 2:
+        _undeprecate(sys.argv[2])
     else:
         print(__doc__); sys.exit(1)
 

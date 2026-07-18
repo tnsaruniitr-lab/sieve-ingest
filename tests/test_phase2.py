@@ -1,9 +1,12 @@
 """Phase-2 drills: rotation cursor, retry-first probing, alerting, scorecard."""
 
+import os
 import subprocess
 import sys
 
 from conftest import add_source, q1
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SEO_PAGE = ('<html><body><main><p>Structured data and sitemaps help search '
             'engines crawl, index and rank pages. {}</p></main></body></html>')
@@ -133,6 +136,6 @@ def test_scorecard_runs(conn, web, fake_llm):
     web.pages['https://example.test/guide'] = SEO_PAGE.format('x')
     _cycle()
     r = subprocess.run([sys.executable, '-m', 'sieve_ingest', 'scorecard'],
-                       capture_output=True, text=True, cwd='/tmp/sieve-ingest-work')
+                       capture_output=True, text=True, cwd=REPO_ROOT)
     assert r.returncode == 0, r.stderr
     assert 'CORPUS:' in r.stdout and 'CHANGES last 7d' in r.stdout

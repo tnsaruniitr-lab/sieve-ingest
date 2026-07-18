@@ -403,7 +403,8 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
     'new' | 'refreshed'. status='candidate' + a custom url_provenance dict is
     the observed-rule path (crawl-derived knowledge, never authority-tier);
     status='deprecated' is the source-marked-deprecated path and survives the
-    refresh (a deprecation must never be reactivated by a re-extraction)."""
+    refresh in BOTH directions (a deprecation must never be reactivated by a
+    re-extraction; only `python -m sieve_ingest undeprecate` reverses it)."""
     key = _rule_key(rule.get('name', ''), rule.get('if_condition', ''))
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM sieve.rules WHERE rule_key=%s LIMIT 1", (key,))
@@ -416,9 +417,18 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
             # (more path depth) or the existing has none; and BACKFILL
             # then_logic if the row somehow has none.
             # Never blanks an existing URL or action — only improves.
-            new_status = 'deprecated' if status == 'deprecated' else 'active'
-            cur.execute("SELECT source_url, then_logic FROM sieve.rules WHERE rule_key=%s", (key,))
-            cur_url, cur_then = cur.fetchone()
+            cur.execute("SELECT source_url, then_logic, status FROM sieve.rules "
+                        "WHERE rule_key=%s", (key,))
+            cur_url, cur_then, cur_status = cur.fetchone()
+            # ONE-WAY LATCH: an existing deprecation survives every later
+            # upsert, whatever status the caller brings — a re-extraction may
+            # nondeterministically omit the marking, or another page (or the
+            # observed-crawl candidate path) may restate the same rule_key as
+            # current advice. Only the operator `undeprecate` CLI reverses it.
+            # retired -> active reactivation stays as-is.
+            new_status = ('deprecated'
+                          if status == 'deprecated' or cur_status == 'deprecated'
+                          else 'active')
             cur_url = cur_url or ''
             more_specific = bool(source_url) and (
                 not cur_url or

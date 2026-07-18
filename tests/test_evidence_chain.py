@@ -157,3 +157,70 @@ def test_refresh_carries_deprecation_and_never_blanks_it(conn):
     assert db.upsert_rule(conn, rule, doc, 'https://example.test/d', 'TestOrg',
                           status='deprecated') == 'refreshed'
     assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'deprecated'
+
+
+def test_deprecation_is_a_one_way_latch(conn):
+    """The OTHER direction: once a rule_key is deprecated, a later upsert
+    WITHOUT the deprecated flag (LLM nondeterministically omits the marking, or
+    a second page restates the rule as current — same name+if_condition, same
+    rule_key) must NOT flip it back to 'active'. Neither may the observed-crawl
+    candidate path (crawl-derived knowledge is never authority-tier). Only the
+    operator `undeprecate` CLI reverses a deprecation."""
+    from sieve_ingest import db
+    db.init_schema(conn)
+    rule = {'name': 'HowTo markup', 'if_condition': 'step content',
+            'then_logic': 'add HowTo schema', 'confidence_score': 0.9}
+    doc = db.upsert_document(conn, 'https://example.test/d', 'TestOrg', 't', 'seo')
+    db.upsert_rule(conn, rule, doc, 'https://example.test/d', 'TestOrg',
+                   status='deprecated')
+    assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'deprecated'
+
+    # Plain re-extraction (default status='active') — latch holds.
+    assert db.upsert_rule(conn, rule, doc, 'https://example.test/d',
+                          'TestOrg') == 'refreshed'
+    assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'deprecated'
+    # A MORE SPECIFIC page restating the rule — the URL-upgrade branch must
+    # not sneak the status back either.
+    assert db.upsert_rule(conn, rule, doc, 'https://example.test/d/deeper/page',
+                          'TestOrg', status='active') == 'refreshed'
+    assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'deprecated'
+    # Observed-crawl candidate path (observe.py) — latch holds too.
+    assert db.upsert_rule(conn, rule, doc, 'https://example.test/d', 'Observed',
+                          status='candidate',
+                          url_provenance={'method': 'observed-crawl'}) == 'refreshed'
+    assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'deprecated'
+
+    # retired -> active reactivation is unaffected by the latch.
+    with conn.cursor() as cur:
+        cur.execute("UPDATE sieve.rules SET status='retired'")
+    assert db.upsert_rule(conn, rule, doc, 'https://example.test/d',
+                          'TestOrg') == 'refreshed'
+    assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'active'
+
+
+def test_undeprecate_cli_is_the_only_way_back(conn):
+    """The deliberate operator escape hatch: `undeprecate <rule_id|rule_key>`
+    reverses the latch; an unknown/non-deprecated ident exits non-zero."""
+    import os
+    import subprocess
+    import sys
+    from sieve_ingest import db
+    db.init_schema(conn)
+    rule = {'name': 'HowTo markup', 'if_condition': 'step content',
+            'then_logic': 'add HowTo schema', 'confidence_score': 0.9}
+    doc = db.upsert_document(conn, 'https://example.test/d', 'TestOrg', 't', 'seo')
+    db.upsert_rule(conn, rule, doc, 'https://example.test/d', 'TestOrg',
+                   status='deprecated')
+    key = q1(conn, "SELECT rule_key FROM sieve.rules")[0]
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def cli(ident):
+        return subprocess.run([sys.executable, '-m', 'sieve_ingest',
+                               'undeprecate', ident],
+                              capture_output=True, text=True, cwd=repo)
+
+    assert cli('rk_no-such-rule').returncode == 1
+    assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'deprecated'
+    r = cli(key)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'active'
