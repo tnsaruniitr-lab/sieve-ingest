@@ -137,11 +137,19 @@ def test_screen_flags_howto_claims_as_deprecated():
         {'name': 'Use JSON-LD', 'if_condition': 'any page',
          'then_logic': 'prefer JSON-LD structured data',
          'confidence_score': 0.9},
+        # the deprecation NOTICE itself: mentions the dead feature but with
+        # anti-reliance framing — must stay active (it IS current guidance)
+        {'name': 'FAQ rich results restricted', 'if_condition': 'FAQPage markup',
+         'then_logic': 'FAQ rich results are no longer shown for most sites; '
+                       'restricted to authoritative government and health sites',
+         'confidence_score': 0.9},
     ]
     kept, rejected = extract._validate_rules(rules, 'https://example.test/x')
-    assert rejected == 0 and len(kept) == 2
+    assert rejected == 0 and len(kept) == 3
     assert extract._rule_status(kept[0]) == 'deprecated', 'HowTo claim flagged'
     assert extract._rule_status(kept[1]) == 'active'
+    assert extract._rule_status(kept[2]) == 'active', \
+        'anti-reliance notice must NOT be flagged deprecated'
 
 
 def test_refresh_carries_deprecation_and_never_blanks_it(conn):

@@ -93,10 +93,19 @@ TEXT:
 # by Google 2023-08, FAQ rich results restricted at the same time). The LLM is
 # INSTRUCTED to mark these (see _PROMPT); this deterministic screen catches the
 # ones it emits as active — flagged onto the deprecated path, never silently
-# kept as current guidance.
+# kept as current guidance. Anti-reliance phrasing (_DEPRECATED_NEG_RE below)
+# exempts a rule that is itself the deprecation notice.
 _DEPRECATED_RE = re.compile(
     r'how-?to rich results?|how-?to (?:schema|markup|structured data)'
     r'|faq(?:page)? rich results?', re.I)
+# Anti-reliance / deprecation-notice phrasing: a rule that itself SAYS the
+# feature is dead ("FAQ rich results are restricted to...", "HowTo is no
+# longer supported") is current guidance, not a stale prescription — it must
+# stay active or the corpus can never cite its own deprecation notices.
+_DEPRECATED_NEG_RE = re.compile(
+    r"no longer|do(?:es)?n'?t rely|do(?:es)? not rely|deprecat|discontinu"
+    r"|\bretired\b|\bsunset|not (?:be )?supported|restricted to"
+    r"|stopp?ed (?:showing|supporting)|will not be shown|avoid(?:ing)? (?:relying|reliance)", re.I)
 
 
 def _salvage_array(raw: str):
@@ -195,8 +204,9 @@ def _validate_rules(rules: List[Dict], url: str) -> tuple:
         if (r.get('name') and r.get('if_condition') and r.get('then_logic')
                 and conf >= MIN_RULE_CONFIDENCE):
             r['confidence_score'] = conf
-            if _rule_status(r) != 'deprecated' and _DEPRECATED_RE.search(
-                    f"{r.get('name')} {r.get('if_condition')} {r.get('then_logic')}"):
+            _text = f"{r.get('name')} {r.get('if_condition')} {r.get('then_logic')}"
+            if (_rule_status(r) != 'deprecated' and _DEPRECATED_RE.search(_text)
+                    and not _DEPRECATED_NEG_RE.search(_text)):
                 r['status'] = 'deprecated'
                 flagged += 1
             kept.append(r)
