@@ -2,7 +2,10 @@
 
 **Mode (since 2026-07-16):** the Railway cron is MONITOR-ONLY (`MAX_URLS_PER_SOURCE=0`
 service variable) — it runs weekly detection + `health` report but never calls the
-Anthropic API. All rule extraction happens through a Claude Code chat session
+Anthropic API. Detected changes are recorded with `extract_status='skipped_monitor'`
+(a per-URL trail in `sieve.ingest_changes`) but never consumed: `url_state` and
+release markers do NOT advance, so re-enabling extraction still sees every pending
+change. All rule extraction happens through a Claude Code chat session
 (subscription tokens, not API dollars) via the file-bridge loop below.
 
 ## The enrichment loop (run in a Claude Code session, ~monthly or on demand)

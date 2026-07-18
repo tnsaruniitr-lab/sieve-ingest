@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS sieve.ingest_changes (
     old_hash     text,
     new_hash     text,
     detected_at  timestamptz NOT NULL DEFAULT now(),
-    extract_status text NOT NULL DEFAULT 'detected',  -- detected | extracted | empty | irrelevant | failed | gave_up
+    extract_status text NOT NULL DEFAULT 'detected',  -- detected | extracted | empty | irrelevant | failed | gave_up | skipped_monitor
     rules_new    int,
     rules_refreshed int
 );
@@ -401,17 +401,22 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
     """Insert a rule, or if a rule with the same rule_key exists, refresh its
     last_verified (proof it's still current) instead of duplicating. Returns
     'new' | 'refreshed'. status='candidate' + a custom url_provenance dict is
-    the observed-rule path (crawl-derived knowledge, never authority-tier)."""
+    the observed-rule path (crawl-derived knowledge, never authority-tier);
+    status='deprecated' is the source-marked-deprecated path and survives the
+    refresh (a deprecation must never be reactivated by a re-extraction)."""
     key = _rule_key(rule.get('name', ''), rule.get('if_condition', ''))
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM sieve.rules WHERE rule_key=%s LIMIT 1", (key,))
         existing = cur.fetchone()
         if existing:
             # Refresh last_verified (+ REACTIVATE if it was retired — the source
-            # page proving it is live again); BACKFILL/UPGRADE source_url when
-            # the new page is more specific (more path depth) or the existing
-            # has none; and BACKFILL then_logic if the row somehow has none.
+            # page proving it is live again, EXCEPT when this extraction says
+            # the source now marks the guidance deprecated: deprecation wins);
+            # BACKFILL/UPGRADE source_url when the new page is more specific
+            # (more path depth) or the existing has none; and BACKFILL
+            # then_logic if the row somehow has none.
             # Never blanks an existing URL or action — only improves.
+            new_status = 'deprecated' if status == 'deprecated' else 'active'
             cur.execute("SELECT source_url, then_logic FROM sieve.rules WHERE rule_key=%s", (key,))
             cur_url, cur_then = cur.fetchone()
             cur_url = cur_url or ''
@@ -421,11 +426,11 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
             if more_specific:
                 cur.execute("UPDATE sieve.rules SET source_url=%s, document_id=%s, "
                             "url_provenance='extracted', last_verified=now(), "
-                            "status='active' WHERE rule_key=%s",
-                            (source_url, doc_id, key))
+                            "status=%s WHERE rule_key=%s",
+                            (source_url, doc_id, new_status, key))
             else:
                 cur.execute("UPDATE sieve.rules SET last_verified=now(), "
-                            "status='active' WHERE rule_key=%s", (key,))
+                            "status=%s WHERE rule_key=%s", (new_status, key))
             if (not cur_then or not str(cur_then).strip()) and rule.get('then_logic'):
                 cur.execute("UPDATE sieve.rules SET then_logic=%s WHERE rule_key=%s",
                             (rule.get('then_logic'), key))

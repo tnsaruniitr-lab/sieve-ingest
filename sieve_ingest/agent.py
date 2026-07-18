@@ -21,6 +21,10 @@ Failure semantics (the load-bearing part):
     of silently waiting out a full 7–30 day cadence.
   - the github_release marker is only advanced when the release's changes were
     all consumed, so a failed extraction doesn't eat the release.
+  - monitor mode (MAX_URLS_PER_SOURCE=0) → changes are recorded with
+    extract_status='skipped_monitor' but NOT consumed and version markers do
+    NOT advance: every cycle re-detects (a per-URL trail in ingest_changes),
+    and re-enabling extraction still sees every pending change.
 
 It never runs inside the auditor's request path. The auditor just reads the
 brain the next time it audits.
@@ -80,7 +84,8 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
     per-source outcome row that goes into ingest_runs.detail."""
     out = {'source_id': s['source_id'], 'status': 'ok', 'changes': 0,
            'extracted': 0, 'empty': 0, 'irrelevant': 0, 'failed': 0,
-           'gave_up': 0, 'rules_new': 0, 'rules_refreshed': 0}
+           'gave_up': 0, 'skipped_monitor': 0, 'rules_new': 0,
+           'rules_refreshed': 0}
     try:
         changes = freshness.detect(conn, s)
     except Exception as e:
@@ -91,7 +96,25 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
             conn, s['source_id'], ok=False, error=f'detect: {e}')
         return out  # source NOT marked crawled — retried next cycle
 
-    all_consumed = True
+    if MAX_URLS_PER_SOURCE <= 0:
+        # Monitor mode: record what changed, extract nothing, consume nothing.
+        # url_state and version markers stay put (marker=None below), so every
+        # cycle re-detects and leaves a per-URL 'skipped_monitor' trail, and
+        # the first extraction-enabled run still sees every pending change.
+        for ch in changes:
+            out['changes'] += 1
+            change_id = db.record_change(conn, run_id, s['source_id'], ch.url,
+                                         ch.change_type, ch.signal,
+                                         ch.old_hash, ch.new_hash)
+            db.update_change_outcome(conn, change_id, 'skipped_monitor', 0, 0)
+            out['skipped_monitor'] += 1
+        db.update_source_health(conn, s['source_id'], ok=True)
+        db.mark_source_crawled(conn, s['source_id'], None)  # marker NOT advanced
+        return out
+
+    # A truncated tail (more changes than the cap) was not consumed either —
+    # it must keep github_release markers from advancing past unextracted work.
+    all_consumed = len(changes) <= MAX_URLS_PER_SOURCE
     for ch in changes[:MAX_URLS_PER_SOURCE]:
         out['changes'] += 1
         change_id = db.record_change(conn, run_id, s['source_id'], ch.url,

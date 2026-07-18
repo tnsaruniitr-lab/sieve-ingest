@@ -70,7 +70,8 @@ Return ONLY a JSON array (max {maxr}) of rules, each:
   "if_condition": "<the situation the rule applies to>",
   "then_logic": "<the recommended action>",
   "domain_tag": "seo|aeo|geo|entity|content|performance|general",
-  "confidence_score": 0.0-1.0}}
+  "confidence_score": 0.0-1.0,
+  "status": "active|deprecated"}}
 
 Rules must be concrete and page-checkable (e.g. "Use JSON-LD for structured
 data", "Author needs hasCredential for YMYL"). Skip marketing fluff, opinions,
@@ -78,9 +79,24 @@ and anything not a testable directive. Preserve technical values (bot names,
 thresholds, tag/property names) verbatim from the source. If the text has no
 real rules, return [].
 
+Deprecation: guidance the source ITSELF marks as deprecated, retired, or
+sunset (e.g. "HowTo rich results are deprecated") must still be emitted, but
+with "status": "deprecated" — never present it as current advice. Everything
+else is "status": "active" (the default if omitted).
+
 TEXT:
 {text}
 """
+
+# Quality-screen backstop for guidance the platforms have deprecated but pages
+# still describe as if current ("HowTo rich result" style claims — deprecated
+# by Google 2023-08, FAQ rich results restricted at the same time). The LLM is
+# INSTRUCTED to mark these (see _PROMPT); this deterministic screen catches the
+# ones it emits as active — flagged onto the deprecated path, never silently
+# kept as current guidance.
+_DEPRECATED_RE = re.compile(
+    r'how-?to rich results?|how-?to (?:schema|markup|structured data)'
+    r'|faq(?:page)? rich results?', re.I)
 
 
 def _salvage_array(raw: str):
@@ -167,8 +183,10 @@ def _extract_rules(text: str, org: str, url: str) -> List[Dict]:
 def _validate_rules(rules: List[Dict], url: str) -> tuple:
     """Write-time quality gate: required fields present + numeric confidence
     above MIN_RULE_CONFIDENCE. Returns (kept, rejected_count) — rejections are
-    counted in the change record, never silently dropped."""
-    kept, rejected = [], 0
+    counted in the change record, never silently dropped. Kept rules whose text
+    matches a known-deprecated claim (_DEPRECATED_RE) are flagged
+    status='deprecated' here when the LLM emitted them as active."""
+    kept, rejected, flagged = [], 0, 0
     for r in rules:
         try:
             conf = float(r.get('confidence_score', 0.0))
@@ -177,12 +195,25 @@ def _validate_rules(rules: List[Dict], url: str) -> tuple:
         if (r.get('name') and r.get('if_condition') and r.get('then_logic')
                 and conf >= MIN_RULE_CONFIDENCE):
             r['confidence_score'] = conf
+            if _rule_status(r) != 'deprecated' and _DEPRECATED_RE.search(
+                    f"{r.get('name')} {r.get('if_condition')} {r.get('then_logic')}"):
+                r['status'] = 'deprecated'
+                flagged += 1
             kept.append(r)
         else:
             rejected += 1
     if rejected:
         log.info('  %s — %d rule(s) rejected by quality gate', url, rejected)
+    if flagged:
+        log.info('  %s — %d rule(s) flagged deprecated by the screen', url, flagged)
     return kept, rejected
+
+
+def _rule_status(r: Dict) -> str:
+    """Normalize the LLM's status field: deprecated/retired/sunset all land on
+    the 'deprecated' path; anything else (including absent) is 'active'."""
+    s = str(r.get('status') or '').strip().lower()
+    return 'deprecated' if s in ('deprecated', 'retired', 'sunset') else 'active'
 
 
 def _chunks(text: str) -> List[str]:
@@ -238,7 +269,8 @@ def ingest_page(conn, changed, source) -> Dict:
     write_errors = 0
     for r in rules:
         try:
-            outcome = db.upsert_rule(conn, r, doc_id=doc_id, source_url=url, source_org=org)
+            outcome = db.upsert_rule(conn, r, doc_id=doc_id, source_url=url,
+                                     source_org=org, status=_rule_status(r))
             counts[outcome] = counts.get(outcome, 0) + 1
         except Exception as e:
             write_errors += 1
