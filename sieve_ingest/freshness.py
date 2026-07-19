@@ -68,13 +68,16 @@ def _skip_locale(loc: str) -> bool:
 detect_stats = {'urls_unchanged': 0, 'verified_refreshed': 0}
 
 
-def _note_unchanged(conn, url: str) -> None:
-    """An unchanged observation (304 / same content hash) is evidence, not a
-    non-event: re-stamp last_verified on the citable brain rows citing this
-    URL (db.refresh_verified_for_url). Best-effort — never breaks a probe."""
+def _note_unchanged(conn, url: str, content_hash: Optional[str]) -> None:
+    """An unchanged observation (304 / same content hash / same lastmod) is
+    evidence, not a non-event: re-stamp last_verified on the brain rows whose
+    verification covers exactly this content version — the fail-closed gates
+    (version evidence, neighbor-guess exclusion, citability) live in
+    db.refresh_verified_for_url. Best-effort — never breaks a probe."""
     detect_stats['urls_unchanged'] += 1
     try:
-        detect_stats['verified_refreshed'] += db.refresh_verified_for_url(conn, url)
+        detect_stats['verified_refreshed'] += db.refresh_verified_for_url(
+            conn, url, content_hash)
     except Exception as e:
         log.warning('re-verify stamp failed for %s: %s', url, e)
 
@@ -204,7 +207,13 @@ def _detect_github_release(conn, source, client) -> List[ChangedURL]:
     if not tag:
         return []
     if tag == source.get('last_seen_marker'):
-        return []  # no new release → nothing changed
+        # No new release — but that IS an unchanged observation for the rows
+        # citing the release page: the marker only advances once the release
+        # was fully consumed (agent), so tag==marker means this exact version
+        # was processed. Without this stamp, release-page rules go dark the
+        # moment the marker lands and look stale forever.
+        _note_unchanged(conn, rel.get('html_url') or source['root_url'], tag)
+        return []
     notes = f"{rel.get('name') or tag}\n\n{rel.get('body') or ''}".strip()
     url = rel.get('html_url') or source['root_url']  # exact release page, not the hub
     return [ChangedURL(url=url, change_type='modified', signal='version',
@@ -225,7 +234,7 @@ def _detect_changelog(conn, source, client) -> List[ChangedURL]:
         log.warning('%s changelog check failed: %s', source['source_id'], e); return []
     prev = db.get_url_state(conn, url)
     if prev and prev.get('content_hash') == h:
-        _note_unchanged(conn, url)
+        _note_unchanged(conn, url, h)
         return []
     return [ChangedURL(url=url, change_type=('new' if not prev else 'modified'),
                        signal='content_hash', old_hash=(prev or {}).get('content_hash'),
@@ -314,7 +323,7 @@ def _probe_url(conn, source, client, loc, lastmod=None):
     if r.status_code == 304:  # server says unchanged
         db.save_url_state(conn, loc, source['source_id'], prev.get('etag'),
                           lastmod or (prev or {}).get('last_modified'), prev.get('content_hash'))
-        _note_unchanged(conn, loc)
+        _note_unchanged(conn, loc, prev.get('content_hash'))
         return None
     if r.status_code in (404, 410) and prev:
         # A page we HAD fingerprinted is gone — the retire signal. Rules that
@@ -328,7 +337,7 @@ def _probe_url(conn, source, client, loc, lastmod=None):
     etag = r.headers.get('ETag')
     if prev and prev.get('content_hash') == h:
         db.save_url_state(conn, loc, source['source_id'], etag, lastmod, h)
-        _note_unchanged(conn, loc)
+        _note_unchanged(conn, loc, h)
         return None
     return ChangedURL(url=loc, change_type=('new' if not prev else 'modified'),
                       signal='content_hash', old_hash=(prev or {}).get('content_hash'),
@@ -392,8 +401,14 @@ def _detect_sitemap(conn, source, client, max_fetch: int = 20) -> List[ChangedUR
             continue
         seen.add(loc)
         prev = db.get_url_state(conn, loc)
-        # lastmod cheap filter: if we've seen it and lastmod didn't move, skip.
+        # lastmod cheap filter: if we've seen it and lastmod didn't move, skip
+        # the probe — but that equality IS an unchanged observation: the
+        # pipeline trusts the signal enough to skip re-extraction, so it must
+        # trust it to re-verify too, or lastmod-accurate sources' most stable
+        # pages (MDN, web.dev) get stamped once and then go permanently dark.
+        # The stored content_hash is the version last confirmed.
         if prev and lastmod and prev.get('last_modified') == lastmod:
+            _note_unchanged(conn, loc, prev.get('content_hash'))
             continue
         if fetched >= max_fetch:
             break

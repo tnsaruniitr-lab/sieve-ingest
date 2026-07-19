@@ -150,12 +150,16 @@ def init_schema(conn=None) -> None:
                 if not have:
                     continue  # table absent on this DB (e.g. playbooks in test fixtures)
                 missing = [(c, ty) for c, ty in _brain_cols.items() if c not in have]
-                if not missing:
-                    continue
-                adds = ', '.join(f'ADD COLUMN IF NOT EXISTS {c} {ty}' for c, ty in missing)
-                cur.execute(f'ALTER TABLE sieve.{t} {adds}')
-                log.info('added %d column(s) to sieve.%s: %s', len(missing), t,
-                         ', '.join(c for c, _ in missing))
+                if missing:
+                    adds = ', '.join(f'ADD COLUMN IF NOT EXISTS {c} {ty}' for c, ty in missing)
+                    cur.execute(f'ALTER TABLE sieve.{t} {adds}')
+                    log.info('added %d column(s) to sieve.%s: %s', len(missing), t,
+                             ', '.join(c for c, _ in missing))
+                # refresh_verified_for_url filters on source_url every cycle —
+                # keep it index-backed (rules rows carry embeddings; a seq scan
+                # per unchanged URL on the live brain is real churn).
+                cur.execute(f'CREATE INDEX IF NOT EXISTS {t}_source_url_idx '
+                            f'ON sieve.{t} (source_url)')
         log.info('control schema + provenance columns ready')
     finally:
         if own:
@@ -290,17 +294,24 @@ def save_url_state(conn, url: str, source_id: str, etag, last_modified, content_
 
 
 # Freshness re-verification: an unchanged observation (304 / identical content
-# hash) is positive evidence the guidance citing that URL is still current.
+# hash) is positive evidence — but only for rows that were actually CONFIRMED
+# from the currently-observed content version (see refresh_verified_for_url).
 # These are the brain kinds that can cite a source_url; the cache maps
-# table -> has_status_column for the ones that actually carry the provenance
-# columns on this DB (playbooks is absent in test fixtures; principles /
-# anti_patterns may lack a status column).
+# table -> the guard columns present on this DB (playbooks is absent in test
+# fixtures; principles/anti_patterns may lack status/url_provenance).
 _VERIFY_KINDS = ('rules', 'principles', 'anti_patterns', 'playbooks')
 _NOT_CITABLE = ('rejected', 'retired', 'superseded', 'deprecated')
-_verify_targets_cache: Dict[str, bool] = {}
+_VERIFY_GUARD_COLS = ('status', 'url_provenance')
+_verify_targets_cache: Dict[str, frozenset] = {}
+
+# Re-stamps younger than this are skipped: sieve.rules rows carry pgvector
+# embeddings, so every stamp rewrites the whole row (MVCC + WAL) on the live
+# shared brain — an unchanged observation seconds after the last one adds no
+# information.
+_REVERIFY_MIN_AGE = '1 hour'
 
 
-def _verify_targets(conn) -> Dict[str, bool]:
+def _verify_targets(conn) -> Dict[str, frozenset]:
     if not _verify_targets_cache:
         with conn.cursor() as cur:
             cur.execute("""
@@ -311,28 +322,61 @@ def _verify_targets(conn) -> Dict[str, bool]:
             """, (_VERIFY_KINDS,))
             for t, cols in cur.fetchall():
                 if 'source_url' in cols and 'last_verified' in cols:
-                    _verify_targets_cache[t] = 'status' in cols
+                    _verify_targets_cache[t] = frozenset(
+                        c for c in _VERIFY_GUARD_COLS if c in cols)
     return _verify_targets_cache
 
 
-def refresh_verified_for_url(conn, url: str) -> int:
-    """A cycle observed `url` unchanged (304 or same content hash) — stamp
-    last_verified=now() on every brain row that cites it via source_url
-    (rules + principles/anti_patterns/playbooks where the columns exist).
-    Guard: rows off the citable path (rejected/retired/superseded/deprecated)
-    are never touched — a retired rule must not look freshly verified; rows
-    with NULL status count as citable (legacy pre-status rows). Returns the
-    number of rows stamped. Runs in monitor mode too — the signal was being
-    computed and discarded there, exactly when it matters most."""
-    if not url:
+def refresh_verified_for_url(conn, url: str, content_hash: Optional[str]) -> int:
+    """A cycle observed `url` unchanged (304 / same content hash / same sitemap
+    lastmod) — re-stamp last_verified=now() on the brain rows citing it via
+    source_url (rules + principles/anti_patterns/playbooks where the columns
+    exist). An unchanged observation only proves the page didn't change since
+    the last fetch, NOT that every citing row's guidance is still on it — so
+    the stamp is gated on evidence, all gates fail-closed:
+
+      * version evidence — the observed content version must be one the
+        pipeline has a change record for (ingest_changes url+new_hash,
+        index-backed), and a row is stamped only when its last_verified is
+        at/after that version's FIRST detection, i.e. the row was
+        (re)confirmed from THIS content. A rewrite that dropped or reworded a
+        rule — or a version consumed as gave_up/empty without re-extracting
+        it — leaves that row behind the cutoff, so staleness decay still
+        works. No hash / no change record → stamp nothing.
+      * neighbor guesses — rows whose url_provenance records a
+        neighbor-adopted URL (backfill_urls) are never stamped: the rule was
+        not extracted from this page, and backfill deliberately withheld
+        last_verified ("a neighbor guess is not verification").
+      * citability — rejected/retired/superseded/deprecated rows are never
+        touched — a retired rule must not look freshly verified; NULL status
+        counts as citable (legacy pre-status rows).
+      * churn — a stamp younger than _REVERIFY_MIN_AGE is not rewritten.
+
+    Returns the number of rows stamped. Runs in monitor mode too — the signal
+    was being computed and discarded there, exactly when it matters most."""
+    if not url or not content_hash:
         return 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT min(detected_at) FROM sieve.ingest_changes "
+                    "WHERE url=%s AND new_hash=%s", (url, content_hash))
+        row = cur.fetchone()
+    cutoff = row[0] if row else None
+    if cutoff is None:
+        return 0  # this content version was never seen/processed — no evidence
     total = 0
-    for table, has_status in _verify_targets(conn).items():
-        guard = " AND COALESCE(status,'active') NOT IN %s" if has_status else ''
-        params = (url, _NOT_CITABLE) if has_status else (url,)
+    for table, guard_cols in _verify_targets(conn).items():
+        conds = ['source_url=%s', 'last_verified >= %s',
+                 f"last_verified < now() - interval '{_REVERIFY_MIN_AGE}'"]
+        params: List[Any] = [url, cutoff]
+        if 'status' in guard_cols:
+            conds.append("COALESCE(status,'active') NOT IN %s")
+            params.append(_NOT_CITABLE)
+        if 'url_provenance' in guard_cols:
+            conds.append("(url_provenance IS NULL OR "
+                         "url_provenance NOT LIKE '%%neighbor%%')")
         with conn.cursor() as cur:
             cur.execute(f"UPDATE sieve.{table} SET last_verified=now() "
-                        f"WHERE source_url=%s{guard}", params)
+                        f"WHERE {' AND '.join(conds)}", params)
             total += cur.rowcount
     return total
 

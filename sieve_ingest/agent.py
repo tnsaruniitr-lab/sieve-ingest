@@ -97,6 +97,10 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
         log.warning('detect failed for %s: %s', s['source_id'], e)
         out['status'] = 'detect_failed'
         out['error'] = str(e)[:300]
+        # Ledger honesty: stamps made before the crash are already in the DB —
+        # a partially-completed detect must report them, not claim 0.
+        out['urls_unchanged'] = freshness.detect_stats['urls_unchanged']
+        out['verified_refreshed'] = freshness.detect_stats['verified_refreshed']
         out['consecutive_failures'] = db.update_source_health(
             conn, s['source_id'], ok=False, error=f'detect: {e}')
         return out  # source NOT marked crawled — retried next cycle

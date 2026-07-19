@@ -80,7 +80,11 @@ def main():
                     except Exception as e:
                         page_drop += 1
                         print(f'  WRITE FAIL {url}: {e}', flush=True)
-                if page_drop and not page_new and not page_ref:
+                if page_drop:
+                    # Cron parity (extract.ingest_page): ANY write failure
+                    # refuses consumption — url_state must not advance past
+                    # rules that never landed. The next harvest re-emits the
+                    # page and upsert_rule dedup makes the replay idempotent.
                     status = 'write_error'
             src_d['statuses'][status] = src_d['statuses'].get(status, 0) + 1
             src_d['new'] += page_new
