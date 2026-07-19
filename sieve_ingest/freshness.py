@@ -62,6 +62,23 @@ def _skip_locale(loc: str) -> bool:
     return bool(_LOCALE_QUERY.search(loc) or _LOCALE_PATH.search(loc))
 
 
+# Per-detect() observability: reset at each detect() entry, read by the caller
+# right after the call (agent copies it into the run detail). Module-level so
+# adapter/probe signatures stay stable — the ingest process is single-threaded.
+detect_stats = {'urls_unchanged': 0, 'verified_refreshed': 0}
+
+
+def _note_unchanged(conn, url: str) -> None:
+    """An unchanged observation (304 / same content hash) is evidence, not a
+    non-event: re-stamp last_verified on the citable brain rows citing this
+    URL (db.refresh_verified_for_url). Best-effort — never breaks a probe."""
+    detect_stats['urls_unchanged'] += 1
+    try:
+        detect_stats['verified_refreshed'] += db.refresh_verified_for_url(conn, url)
+    except Exception as e:
+        log.warning('re-verify stamp failed for %s: %s', url, e)
+
+
 def _norm_hash(text: str) -> str:
     return hashlib.sha256(re.sub(r'\s+', ' ', text or '').strip().encode()).hexdigest()
 
@@ -208,6 +225,7 @@ def _detect_changelog(conn, source, client) -> List[ChangedURL]:
         log.warning('%s changelog check failed: %s', source['source_id'], e); return []
     prev = db.get_url_state(conn, url)
     if prev and prev.get('content_hash') == h:
+        _note_unchanged(conn, url)
         return []
     return [ChangedURL(url=url, change_type=('new' if not prev else 'modified'),
                        signal='content_hash', old_hash=(prev or {}).get('content_hash'),
@@ -296,6 +314,7 @@ def _probe_url(conn, source, client, loc, lastmod=None):
     if r.status_code == 304:  # server says unchanged
         db.save_url_state(conn, loc, source['source_id'], prev.get('etag'),
                           lastmod or (prev or {}).get('last_modified'), prev.get('content_hash'))
+        _note_unchanged(conn, loc)
         return None
     if r.status_code in (404, 410) and prev:
         # A page we HAD fingerprinted is gone — the retire signal. Rules that
@@ -309,6 +328,7 @@ def _probe_url(conn, source, client, loc, lastmod=None):
     etag = r.headers.get('ETag')
     if prev and prev.get('content_hash') == h:
         db.save_url_state(conn, loc, source['source_id'], etag, lastmod, h)
+        _note_unchanged(conn, loc)
         return None
     return ChangedURL(url=loc, change_type=('new' if not prev else 'modified'),
                       signal='content_hash', old_hash=(prev or {}).get('content_hash'),
@@ -420,7 +440,10 @@ _ADAPTERS = {
 
 
 def detect(conn, source) -> List[ChangedURL]:
-    """Dispatch to the source's adapter. Returns changed URLs (may be empty)."""
+    """Dispatch to the source's adapter. Returns changed URLs (may be empty).
+    Side channel: detect_stats carries this call's unchanged/re-verified counts."""
+    detect_stats['urls_unchanged'] = 0
+    detect_stats['verified_refreshed'] = 0
     adapter = _ADAPTERS.get(source.get('adapter_type', 'sitemap'), _detect_sitemap)
     # Generous timeout — some canonical sitemaps (web.dev, MDN) are large/slow.
     timeout = httpx.Timeout(float(os.getenv('INGEST_HTTP_TIMEOUT', '45')), connect=15.0)

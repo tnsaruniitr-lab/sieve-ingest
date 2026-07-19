@@ -289,6 +289,54 @@ def save_url_state(conn, url: str, source_id: str, etag, last_modified, content_
         """, (url, source_id, etag, last_modified, content_hash))
 
 
+# Freshness re-verification: an unchanged observation (304 / identical content
+# hash) is positive evidence the guidance citing that URL is still current.
+# These are the brain kinds that can cite a source_url; the cache maps
+# table -> has_status_column for the ones that actually carry the provenance
+# columns on this DB (playbooks is absent in test fixtures; principles /
+# anti_patterns may lack a status column).
+_VERIFY_KINDS = ('rules', 'principles', 'anti_patterns', 'playbooks')
+_NOT_CITABLE = ('rejected', 'retired', 'superseded', 'deprecated')
+_verify_targets_cache: Dict[str, bool] = {}
+
+
+def _verify_targets(conn) -> Dict[str, bool]:
+    if not _verify_targets_cache:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name, array_agg(column_name)
+                FROM information_schema.columns
+                WHERE table_schema='sieve' AND table_name IN %s
+                GROUP BY table_name
+            """, (_VERIFY_KINDS,))
+            for t, cols in cur.fetchall():
+                if 'source_url' in cols and 'last_verified' in cols:
+                    _verify_targets_cache[t] = 'status' in cols
+    return _verify_targets_cache
+
+
+def refresh_verified_for_url(conn, url: str) -> int:
+    """A cycle observed `url` unchanged (304 or same content hash) — stamp
+    last_verified=now() on every brain row that cites it via source_url
+    (rules + principles/anti_patterns/playbooks where the columns exist).
+    Guard: rows off the citable path (rejected/retired/superseded/deprecated)
+    are never touched — a retired rule must not look freshly verified; rows
+    with NULL status count as citable (legacy pre-status rows). Returns the
+    number of rows stamped. Runs in monitor mode too — the signal was being
+    computed and discarded there, exactly when it matters most."""
+    if not url:
+        return 0
+    total = 0
+    for table, has_status in _verify_targets(conn).items():
+        guard = " AND COALESCE(status,'active') NOT IN %s" if has_status else ''
+        params = (url, _NOT_CITABLE) if has_status else (url,)
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE sieve.{table} SET last_verified=now() "
+                        f"WHERE source_url=%s{guard}", params)
+            total += cur.rowcount
+    return total
+
+
 def record_change(conn, run_id, source_id, url, change_type, signal, old_hash, new_hash) -> int:
     """Record a detected change (extract_status='detected'); returns change_id so
     the extraction outcome can be written back onto the same row."""

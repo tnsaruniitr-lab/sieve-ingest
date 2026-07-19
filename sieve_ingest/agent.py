@@ -85,9 +85,14 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
     out = {'source_id': s['source_id'], 'status': 'ok', 'changes': 0,
            'extracted': 0, 'empty': 0, 'irrelevant': 0, 'failed': 0,
            'gave_up': 0, 'skipped_monitor': 0, 'rules_new': 0,
-           'rules_refreshed': 0}
+           'rules_refreshed': 0, 'urls_unchanged': 0, 'verified_refreshed': 0}
     try:
         changes = freshness.detect(conn, s)
+        # Freshness re-verification side channel: unchanged observations (304 /
+        # same hash) stamped last_verified on their citing rows inside detect —
+        # monitor mode included. Copy the counts into the run detail.
+        out['urls_unchanged'] = freshness.detect_stats['urls_unchanged']
+        out['verified_refreshed'] = freshness.detect_stats['verified_refreshed']
     except Exception as e:
         log.warning('detect failed for %s: %s', s['source_id'], e)
         out['status'] = 'detect_failed'
@@ -212,6 +217,8 @@ def run_cycle() -> dict:
                    'sources_changed': sources_changed, 'urls_changed': urls_changed,
                    'rules_written': objects_written, 'rules_embedded': embedded,
                    'rules_retired': sum(o.get('retired', 0) for o in outcomes),
+                   'rules_verified': sum(o.get('verified_refreshed', 0)
+                                         for o in outcomes),
                    'failed_sources': [o['source_id'] for o in outcomes
                                       if o['status'] != 'ok']}
         log.info('run %s %s: %s', run_id, status, summary)

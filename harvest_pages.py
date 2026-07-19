@@ -4,9 +4,12 @@ harvest_pages.py — catch-up crawl WITHOUT LLM extraction (file-bridge mode).
 Runs the freshness detection for ALL enabled sources (ignoring cadence — this
 is the one-time catch-up), fetches changed pages, and dumps their text to a
 JSONL file for in-chat extraction by local Claude. NO Anthropic API calls, and
-NO state writes (url_state / last_crawled / ingest_runs untouched) — state is
-committed later by ingest_extracted.py only for pages whose rules were written,
-preserving the retry-on-failure semantics.
+NO change-consuming state writes (changed pages' url_state / last_crawled /
+ingest_runs untouched) — state is committed later by ingest_extracted.py only
+for pages whose rules were written, preserving the retry-on-failure semantics.
+(UNCHANGED pages do get their url_state refreshed and their citing rules'
+last_verified re-stamped inside freshness.detect — that observation is real
+whichever caller makes it.)
 
     railway run .venv-local/bin/python harvest_pages.py <out.jsonl> [max_per_source]
 """
@@ -17,6 +20,23 @@ from sieve_ingest import db, freshness
 
 MAX_PER_SOURCE = int(sys.argv[2]) if len(sys.argv) > 2 else 25
 OUT = sys.argv[1] if len(sys.argv) > 1 else 'harvest.jsonl'
+
+
+def _fetch_text(url: str) -> str:
+    """On-demand fetch for changes that signal without carrying text (the old
+    extract._fetch_text — extract.py no longer fetches, so the bridge owns it).
+    Best effort; empty string on failure."""
+    try:
+        import httpx
+
+        from sieve_ingest.freshness import UA, _main_text
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            r = client.get(url, headers=UA)
+            if r.status_code == 200:
+                return _main_text(r.text)
+    except Exception as e:
+        print(f'  on-demand fetch failed for {url}: {e}', flush=True)
+    return ''
 
 
 def main():
@@ -39,10 +59,7 @@ def main():
             for ch in changes:
                 if kept >= MAX_PER_SOURCE:
                     break
-                text = ch.text
-                if not text:
-                    from sieve_ingest.extract import _fetch_text
-                    text = _fetch_text(ch.url)
+                text = ch.text or _fetch_text(ch.url)
                 if not text or len(text.strip()) < 200:
                     continue
                 f.write(json.dumps({
@@ -54,7 +71,10 @@ def main():
                 }, ensure_ascii=False) + '\n')
                 kept += 1
                 n_pages += 1
-            print(f'  {s["source_id"]}: {len(changes)} changed, {kept} harvested', flush=True)
+            print(f'  {s["source_id"]}: {len(changes)} changed, {kept} harvested, '
+                  f'{freshness.detect_stats["urls_unchanged"]} unchanged '
+                  f'({freshness.detect_stats["verified_refreshed"]} rules re-verified)',
+                  flush=True)
     print(f'\nDONE — {n_pages} pages harvested to {OUT}', flush=True)
     conn.close()
 
