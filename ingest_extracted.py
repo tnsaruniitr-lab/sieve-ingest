@@ -8,8 +8,9 @@ then advances url_state / last_crawled / ingest_runs so the weekly cron only
 sees future deltas.
 
 Input line shape:
-    {"source_id","org","url","title","new_hash","rules":[{name,if_condition,
-     then_logic,domain_tag,confidence_score[,status]}, ...]}
+    {"source_id","org","url","title","new_hash","text","rules":[{
+     name,if_condition,then_logic,source_excerpt,domain_tag,
+     confidence_score[,status]}, ...]}
 Pages with rules=[] are committed as legitimately-empty (url_state advanced).
 Rules pass the cron's write-time gate (extract._validate_rules: required
 fields + MIN_RULE_CONFIDENCE floor + deprecation screen); status
@@ -49,12 +50,18 @@ def main():
                                          page.get('signal', 'content_hash'),
                                          None, page.get('new_hash'))
 
+            # Production runs this file bridge while the cron is monitor-only.
+            # Reconcile old receipts here too: a vanished exact excerpt becomes
+            # uncitable immediately; a retained excerpt is rebound to new_hash.
+            db.reconcile_rules_for_content(
+                conn, url, page.get('new_hash'), page.get('text') or '')
+
             # Same write-time gate as the cron (extract._validate_rules):
             # required fields + confidence floor, and the deprecation screen
             # flags known-dead guidance emitted as active.
             raw = [r for r in (page.get('rules') or []) if isinstance(r, dict)]
             non_dict = len(page.get('rules') or []) - len(raw)
-            rules, rejected = extract._validate_rules(raw, url)
+            rules, rejected = extract._validate_rules(raw, url, page.get('text') or '')
             totals['invalid_rules'] += rejected + non_dict
 
             status = 'ok' if rules else 'empty'
@@ -72,7 +79,8 @@ def main():
                     try:
                         outcome = db.upsert_rule(conn, r, doc_id=doc_id,
                                                  source_url=url, source_org=org,
-                                                 status=extract._rule_status(r))
+                                                 status=extract._rule_status(r),
+                                                 content_hash=page.get('new_hash'))
                         if outcome == 'new':
                             page_new += 1
                         else:

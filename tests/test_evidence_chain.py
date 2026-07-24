@@ -104,6 +104,50 @@ def test_monitor_mode_sitemap_consumes_nothing(conn, web, fake_llm, monkeypatch)
     assert q1(conn, "SELECT count(*) FROM sieve.rules")[0] == 0
 
 
+def test_monitor_mode_supersedes_disappeared_excerpt_immediately(conn, web,
+                                                                 fake_llm,
+                                                                 monkeypatch):
+    """Monitor-only production cannot leave old proof trusted while manual
+    extraction is pending after a source rewrite."""
+    from sieve_ingest import agent
+    add_source(conn)
+    url = 'https://example.test/guide'
+    web.sitemap['https://example.test/sitemap.xml'] = [(url, None)]
+    web.pages[url] = HOWTO_PAGE
+    assert _cycle()['rules_written'] == 1
+
+    monkeypatch.setattr(agent, 'MAX_URLS_PER_SOURCE', 0)
+    web.pages[url] = HOWTO_PAGE.replace(
+        'Use HowTo structured data markup so your steps can appear',
+        'This guidance was removed from the page')
+    make_due(conn)
+    summary = _cycle()
+    assert summary['urls_changed'] == 1
+    assert q1(conn, "SELECT status, provenance_status FROM sieve.rules") == \
+        ('superseded', 'source_changed')
+
+
+def test_monitor_mode_retires_rules_when_source_page_is_removed(conn, web,
+                                                                fake_llm,
+                                                                monkeypatch):
+    from sieve_ingest import agent
+    add_source(conn)
+    url = 'https://example.test/guide'
+    web.sitemap['https://example.test/sitemap.xml'] = [(url, None)]
+    web.pages[url] = HOWTO_PAGE
+    assert _cycle()['rules_written'] == 1
+
+    monkeypatch.setattr(agent, 'MAX_URLS_PER_SOURCE', 0)
+    # Keep the URL discoverable in the sitemap but make the page return 404.
+    # A sitemap omission alone is not authoritative proof that a page was
+    # deleted; the explicit 404/410 response is the retirement signal.
+    del web.pages[url]
+    make_due(conn)
+    summary = _cycle()
+    assert summary['urls_changed'] == 1
+    assert q1(conn, "SELECT status FROM sieve.rules")[0] == 'retired'
+
+
 # ---------------------------------------------------------------------------
 # Deprecation path (source-marked + screen-flagged)
 # ---------------------------------------------------------------------------
@@ -119,6 +163,7 @@ def test_llm_deprecated_status_reaches_the_brain(conn, web, monkeypatch):
     monkeypatch.setattr(extract, '_extract_rules', lambda text, org, url: [
         {'name': 'Add author bylines', 'if_condition': 'article pages',
          'then_logic': 'show a byline', 'domain_tag': 'content',
+         'source_excerpt': 'Use HowTo structured data markup so your steps can appear',
          'confidence_score': 0.9, 'status': 'deprecated'}])
 
     summary = _cycle()
@@ -133,18 +178,24 @@ def test_screen_flags_howto_claims_as_deprecated():
     rules = [
         {'name': 'Add HowTo markup', 'if_condition': 'step-by-step content',
          'then_logic': 'use HowTo structured data for HowTo rich results',
+         'source_excerpt': 'Use HowTo structured data for HowTo rich results.',
          'confidence_score': 0.9},
         {'name': 'Use JSON-LD', 'if_condition': 'any page',
          'then_logic': 'prefer JSON-LD structured data',
+         'source_excerpt': 'Prefer JSON-LD structured data for supported features.',
          'confidence_score': 0.9},
         # the deprecation NOTICE itself: mentions the dead feature but with
         # anti-reliance framing — must stay active (it IS current guidance)
         {'name': 'FAQ rich results restricted', 'if_condition': 'FAQPage markup',
          'then_logic': 'FAQ rich results are no longer shown for most sites; '
                        'restricted to authoritative government and health sites',
+         'source_excerpt': 'FAQ rich results are no longer shown for most sites.',
          'confidence_score': 0.9},
     ]
-    kept, rejected = extract._validate_rules(rules, 'https://example.test/x')
+    source = ('Use HowTo structured data for HowTo rich results. '
+              'Prefer JSON-LD structured data for supported features. '
+              'FAQ rich results are no longer shown for most sites.')
+    kept, rejected = extract._validate_rules(rules, 'https://example.test/x', source)
     assert rejected == 0 and len(kept) == 3
     assert extract._rule_status(kept[0]) == 'deprecated', 'HowTo claim flagged'
     assert extract._rule_status(kept[1]) == 'active'

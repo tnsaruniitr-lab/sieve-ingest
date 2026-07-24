@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger('ingest.db')
@@ -160,6 +161,24 @@ def init_schema(conn=None) -> None:
                 # per unchanged URL on the live brain is real churn).
                 cur.execute(f'CREATE INDEX IF NOT EXISTS {t}_source_url_idx '
                             f'ON sieve.{t} (source_url)')
+            # A rule is citation-grade only when its recommendation is backed
+            # by a verbatim excerpt from a specific fetched content version.
+            cur.execute("SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema='sieve' AND table_name='rules'")
+            rule_cols = {r[0] for r in cur.fetchall()}
+            if rule_cols:
+                proof_cols = {
+                    'source_excerpt': 'text',
+                    'source_content_hash': 'text',
+                    'provenance_status': "text NOT NULL DEFAULT 'unverified'",
+                }
+                missing = [(c, ty) for c, ty in proof_cols.items() if c not in rule_cols]
+                if missing:
+                    adds = ', '.join(f'ADD COLUMN IF NOT EXISTS {c} {ty}'
+                                     for c, ty in missing)
+                    cur.execute(f'ALTER TABLE sieve.rules {adds}')
+                    log.info('added %d source-proof column(s) to sieve.rules: %s',
+                             len(missing), ', '.join(c for c, _ in missing))
         log.info('control schema + provenance columns ready')
     finally:
         if own:
@@ -482,6 +501,70 @@ def retire_rules_for_url(conn, source_url: str) -> int:
         return n
 
 
+def reconcile_rules_for_content(conn, source_url: str, content_hash: str,
+                                source_text: str) -> Dict[str, int]:
+    """Reconcile active proof rows against a newly fetched source version.
+
+    An exact stored excerpt that still exists is deterministic re-verification:
+    bind it to the new content hash. If the excerpt disappeared, immediately
+    supersede the rule instead of leaving an obsolete but citation-eligible
+    receipt alive until an age threshold expires. Whitespace may reflow during
+    extraction; capitalization and wording must remain exact.
+    """
+    stats = {'confirmed': 0, 'superseded': 0}
+    if not source_url or not content_hash or not source_text:
+        return stats
+    normalized_source = re.sub(r'\s+', ' ', str(source_text)).strip()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, source_excerpt, source_content_hash
+            FROM sieve.rules
+            WHERE source_url=%s
+              AND coalesce(status,'active')='active'
+              AND coalesce(rule_type,'') <> 'observed'
+              AND provenance_status IN ('verified_excerpt','source_change_pending')
+              AND coalesce(source_excerpt,'') <> ''
+        """, (source_url,))
+        rows = cur.fetchall()
+        for rid, excerpt, old_hash in rows:
+            normalized_excerpt = re.sub(r'\s+', ' ', str(excerpt)).strip()
+            if normalized_excerpt and normalized_excerpt in normalized_source:
+                cur.execute("""
+                    UPDATE sieve.rules
+                    SET source_content_hash=%s, last_verified=now()
+                    WHERE id=%s
+                """, (content_hash, rid))
+                stats['confirmed'] += 1
+            elif old_hash != content_hash:
+                cur.execute("""
+                    UPDATE sieve.rules
+                    SET status='superseded', provenance_status='source_changed'
+                    WHERE id=%s
+                """, (rid,))
+                stats['superseded'] += 1
+    return stats
+
+
+def mark_rules_source_change_pending(conn, source_url: str) -> int:
+    """Fail closed when a source version changed but no text was available.
+
+    The rule remains in the corpus for later reconciliation, but cannot be
+    cited as proof until the file bridge or extractor confirms its exact
+    excerpt against the new bytes.
+    """
+    if not source_url:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE sieve.rules
+            SET provenance_status='source_change_pending'
+            WHERE source_url=%s
+              AND coalesce(status,'active')='active'
+              AND provenance_status='verified_excerpt'
+        """, (source_url,))
+        return cur.rowcount
+
+
 def _rule_key(name: str, if_cond: str) -> str:
     return 'rk_' + hashlib.sha256(f'{(name or "").strip().lower()}|{(if_cond or "").strip().lower()}'
                                   .encode()).hexdigest()[:20]
@@ -489,7 +572,8 @@ def _rule_key(name: str, if_cond: str) -> str:
 
 def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
                 source_org: str, status: str = 'active',
-                url_provenance: Optional[Dict[str, Any]] = None) -> str:
+                url_provenance: Optional[Dict[str, Any]] = None,
+                content_hash: Optional[str] = None) -> str:
     """Insert a rule, or if a rule with the same rule_key exists, refresh its
     last_verified (proof it's still current) instead of duplicating. Returns
     'new' | 'refreshed'. status='candidate' + a custom url_provenance dict is
@@ -498,6 +582,9 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
     refresh in BOTH directions (a deprecation must never be reactivated by a
     re-extraction; only `python -m sieve_ingest undeprecate` reverses it)."""
     key = _rule_key(rule.get('name', ''), rule.get('if_condition', ''))
+    excerpt = str(rule.get('source_excerpt') or '').strip()[:1000] or None
+    proof_status = ('observed' if url_provenance else
+                    'verified_excerpt' if excerpt and content_hash else 'unverified')
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM sieve.rules WHERE rule_key=%s LIMIT 1", (key,))
         existing = cur.fetchone()
@@ -509,9 +596,9 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
             # (more path depth) or the existing has none; and BACKFILL
             # then_logic if the row somehow has none.
             # Never blanks an existing URL or action — only improves.
-            cur.execute("SELECT source_url, then_logic, status FROM sieve.rules "
-                        "WHERE rule_key=%s", (key,))
-            cur_url, cur_then, cur_status = cur.fetchone()
+            cur.execute("SELECT source_url, then_logic, status, provenance_status "
+                        "FROM sieve.rules WHERE rule_key=%s", (key,))
+            cur_url, cur_then, cur_status, cur_proof_status = cur.fetchone()
             # ONE-WAY LATCH: an existing deprecation survives every later
             # upsert, whatever status the caller brings — a re-extraction may
             # nondeterministically omit the marking, or another page (or the
@@ -525,14 +612,41 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
             more_specific = bool(source_url) and (
                 not cur_url or
                 source_url.rstrip('/').count('/') > cur_url.rstrip('/').count('/'))
-            if more_specific:
+            if more_specific and (
+                    proof_status == 'verified_excerpt'
+                    or cur_proof_status != 'verified_excerpt'):
                 cur.execute("UPDATE sieve.rules SET source_url=%s, document_id=%s, "
                             "url_provenance='extracted', last_verified=now(), "
-                            "status=%s WHERE rule_key=%s",
-                            (source_url, doc_id, new_status, key))
+                            "status=%s, source_excerpt=%s, source_content_hash=%s, "
+                            "provenance_status=%s WHERE rule_key=%s",
+                            (source_url, doc_id, new_status, excerpt, content_hash,
+                             proof_status, key))
+            elif proof_status == 'verified_excerpt' and cur_proof_status != 'verified_excerpt':
+                # Upgrade legacy/unattested rows only when this exact source
+                # version supplied a verbatim excerpt. Keep the existing URL
+                # and proof together unless it was blank or this URL matches.
+                if not cur_url or cur_url == source_url:
+                    cur.execute("UPDATE sieve.rules SET source_url=%s, document_id=%s, "
+                                "url_provenance='extracted', last_verified=now(), "
+                                "status=%s, source_excerpt=%s, source_content_hash=%s, "
+                                "provenance_status=%s WHERE rule_key=%s",
+                                (source_url, doc_id, new_status, excerpt, content_hash,
+                                 proof_status, key))
+                else:
+                    cur.execute("UPDATE sieve.rules SET status=%s WHERE rule_key=%s",
+                                (new_status, key))
             else:
-                cur.execute("UPDATE sieve.rules SET last_verified=now(), "
-                            "status=%s WHERE rule_key=%s", (new_status, key))
+                # Unattested refreshes cannot make evidence look freshly
+                # verified. A matching verified extraction may refresh only
+                # the same source URL and content-bound proof.
+                if proof_status == 'verified_excerpt' and cur_url == source_url:
+                    cur.execute("UPDATE sieve.rules SET last_verified=now(), "
+                                "status=%s, source_excerpt=%s, source_content_hash=%s, "
+                                "provenance_status=%s WHERE rule_key=%s",
+                                (new_status, excerpt, content_hash, proof_status, key))
+                else:
+                    cur.execute("UPDATE sieve.rules SET status=%s WHERE rule_key=%s",
+                                (new_status, key))
             if (not cur_then or not str(cur_then).strip()) and rule.get('then_logic'):
                 cur.execute("UPDATE sieve.rules SET then_logic=%s WHERE rule_key=%s",
                             (rule.get('then_logic'), key))
@@ -547,14 +661,15 @@ def upsert_rule(conn, rule: Dict[str, Any], doc_id: str, source_url: str,
                 (id, name, rule_type, if_condition, then_logic, domain_tag,
                  confidence_score, source_refs_json, status, created_at,
                  source_org, source_url, document_id, extracted_at, last_verified,
-                 rule_key, url_provenance)
+                 rule_key, url_provenance, source_excerpt, source_content_hash,
+                 provenance_status)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, now(),
-                    %s,%s,%s, now(), now(), %s, %s)
+                    %s,%s,%s, now(), now(), %s, %s, %s, %s, %s)
         """, (new_id, rule.get('name'), rule.get('rule_type', 'ingested'),
               rule.get('if_condition'), rule.get('then_logic'), rule.get('domain_tag', 'general'),
               str(rule.get('confidence_score', 0.8)), f'[{doc_id}]', status,
-              source_org, source_url, doc_id, key,
-              prov))
+              source_org, source_url, doc_id, key, prov, excerpt, content_hash,
+              proof_status))
         return 'new'
 
 

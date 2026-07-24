@@ -85,7 +85,9 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
     out = {'source_id': s['source_id'], 'status': 'ok', 'changes': 0,
            'extracted': 0, 'empty': 0, 'irrelevant': 0, 'failed': 0,
            'gave_up': 0, 'skipped_monitor': 0, 'rules_new': 0,
-           'rules_refreshed': 0, 'urls_unchanged': 0, 'verified_refreshed': 0}
+           'rules_refreshed': 0, 'urls_unchanged': 0, 'verified_refreshed': 0,
+           'rules_reconfirmed': 0, 'rules_superseded': 0,
+           'rules_pending': 0, 'retired': 0}
     try:
         changes = freshness.detect(conn, s)
         # Freshness re-verification side channel: unchanged observations (304 /
@@ -115,6 +117,21 @@ def _process_source(conn, run_id: int, s: dict) -> dict:
             change_id = db.record_change(conn, run_id, s['source_id'], ch.url,
                                          ch.change_type, ch.signal,
                                          ch.old_hash, ch.new_hash)
+            # Monitoring must still invalidate evidence immediately. A changed
+            # source with fetched text can be reconciled deterministically; a
+            # text-less version signal fails closed until manual ingestion; a
+            # deleted page retires its rules now because harvest cannot carry
+            # a body for it into the file bridge.
+            if ch.change_type == 'removed':
+                out['retired'] += db.retire_rules_for_url(conn, ch.url)
+            elif ch.text and ch.new_hash:
+                reconciled = db.reconcile_rules_for_content(
+                    conn, ch.url, ch.new_hash, ch.text)
+                out['rules_reconfirmed'] += reconciled['confirmed']
+                out['rules_superseded'] += reconciled['superseded']
+            elif ch.new_hash:
+                out['rules_pending'] += db.mark_rules_source_change_pending(
+                    conn, ch.url)
             db.update_change_outcome(conn, change_id, 'skipped_monitor', 0, 0)
             out['skipped_monitor'] += 1
         db.update_source_health(conn, s['source_id'], ok=True)

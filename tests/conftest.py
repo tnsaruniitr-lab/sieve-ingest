@@ -124,9 +124,11 @@ def fake_llm(monkeypatch):
             raise extract.ExtractError('simulated LLM outage')
         if state['mode'] == 'empty':
             return []
+        excerpt = ' '.join(str(text).split())[:160]
         return [{'name': f'Rule from {url.rsplit("/", 1)[-1]}',
                  'if_condition': f'situation on {url}',
                  'then_logic': 'do the right thing',
+                 'source_excerpt': excerpt,
                  'domain_tag': 'seo', 'confidence_score': 0.9}]
 
     monkeypatch.setattr(extract, '_extract_rules', _fake)

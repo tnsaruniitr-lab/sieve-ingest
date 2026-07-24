@@ -35,7 +35,8 @@ SELECT 'rules' AS tbl, domain_tag::text, count(*) AS n,
        count(*) FILTER (WHERE last_verified IS NULL
              OR last_verified < now()-interval '90 days') AS stale_90d,
        count(*) FILTER (WHERE embedding IS NULL) AS missing_embedding
-FROM sieve.rules WHERE status IS DISTINCT FROM 'deprecated' GROUP BY 2
+FROM sieve.rules
+WHERE coalesce(status,'active') IN ('active','candidate') GROUP BY 2
 UNION ALL
 SELECT 'principles', domain_tag::text, count(*),
        round(100.0*count(*) FILTER (WHERE source_url IS NOT NULL AND source_url<>'')/count(*),1),
@@ -76,17 +77,25 @@ GROUP BY 1 HAVING count(DISTINCT source_org)>1 ORDER BY n DESC;
 
 CREATE OR REPLACE VIEW sieve.v_trusted_rules AS
 SELECT * FROM sieve.rules
-WHERE status IS DISTINCT FROM 'deprecated'
+WHERE coalesce(status,'active') = 'active'
   AND coalesce(rule_type,'') <> 'observed'   -- crawl-derived knowledge is never trusted-tier
+  AND provenance_status = 'verified_excerpt'
+  AND coalesce(source_excerpt,'') <> ''
+  AND coalesce(source_content_hash,'') <> ''
   AND confidence_score ~ '^[0-9]+(\.[0-9]+)?$' AND confidence_score::numeric >= 0.85
   AND coalesce(source_org,'') NOT IN ('', 'Personal Blog', 'Unknown', 'unattributed-legacy');
 """
 
 SNAPSHOT_SQL = """
 SELECT jsonb_build_object(
-  'rules_total',         (SELECT count(*) FROM sieve.rules WHERE status IS DISTINCT FROM 'deprecated'),
+  'rules_total',         (SELECT count(*) FROM sieve.rules WHERE coalesce(status,'active') IN ('active','candidate')),
   'rules_url_pct',       (SELECT round(100.0*count(*) FILTER (WHERE source_url<>'' AND source_url IS NOT NULL)/count(*),1) FROM sieve.rules),
   'rules_trusted',       (SELECT count(*) FROM sieve.v_trusted_rules),
+  'rules_source_faithful',(SELECT count(*) FROM sieve.rules
+                           WHERE coalesce(status,'active')='active'
+                             AND provenance_status='verified_excerpt'
+                             AND coalesce(source_excerpt,'')<>''
+                             AND coalesce(source_content_hash,'')<>''),
   'principles_total',    (SELECT count(*) FROM sieve.principles),
   'principles_url_pct',  (SELECT round(100.0*count(*) FILTER (WHERE source_url<>'' AND source_url IS NOT NULL)/count(*),1) FROM sieve.principles),
   'anti_patterns_total', (SELECT count(*) FROM sieve.anti_patterns),

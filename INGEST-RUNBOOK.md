@@ -21,10 +21,15 @@ railway run .venv-local/bin/python harvest_pages.py /tmp/harvest.jsonl 25
 # 2. EXTRACT — Claude (in-chat subagents) turns pages into rules using the rubric
 #    in the sieve-local-extraction workflow (scratchpad chunks → extracted_*.jsonl).
 #    Rubric: atomic testable rules, verbatim technical values, max 8/page,
-#    0.9+ confidence only for first-party normative statements.
+#    0.9+ confidence only for first-party normative statements. Every rule
+#    MUST include source_excerpt copied exactly from that page's `text` field;
+#    paraphrased or missing excerpts are rejected at ingest.
 
 # 3. INGEST — commit rules with full provenance + advance url_state/run log
 railway run .venv-local/bin/python ingest_extracted.py /tmp/extracted_all.jsonl
+#    Existing legacy rows remain provenance_status='unverified' until they pass
+#    this excerpt+content-hash path. On later source changes, retained excerpts
+#    are rebound to the new hash and disappeared excerpts are superseded at once.
 
 # 4. EMBED — vectors for the new rules (needs a 1536-dim OpenAI key, e.g. loopr/.env)
 OPENAI_API_KEY=... railway run .venv-local/bin/python embed_brain.py

@@ -99,15 +99,20 @@ def test_ingest_extracted_commits_through_provenance_path(conn, tmp_path,
     infile.write_text(json.dumps({
         'source_id': 'test-src', 'org': 'TestOrg',
         'url': 'https://example.test/guide', 'title': 'Guide',
+        'text': ('Use JSON-LD when a page has structured data. Emit JSON-LD. '
+                 'HowTo rich results are no longer supported. Low confidence note.'),
         'new_hash': 'abc123', 'rules': [
             {'name': 'Use JSON-LD', 'if_condition': 'page has structured data',
              'then_logic': 'emit JSON-LD', 'domain_tag': 'seo',
+             'source_excerpt': 'Use JSON-LD when a page has structured data.',
              'confidence_score': 0.9},
             {'name': 'HowTo is dead', 'if_condition': 'page uses HowTo markup',
              'then_logic': 'HowTo rich results are no longer supported',
+             'source_excerpt': 'HowTo rich results are no longer supported.',
              'domain_tag': 'seo', 'confidence_score': 0.9,
              'status': 'deprecated'},
             {'name': 'Low conf', 'if_condition': 'x', 'then_logic': 'y',
+             'source_excerpt': 'Low confidence note.',
              'domain_tag': 'seo', 'confidence_score': 0.2},  # below the floor
             'not-a-dict',
         ]}) + '\n')
@@ -135,6 +140,36 @@ def test_ingest_extracted_commits_through_provenance_path(conn, tmp_path,
         == ('done', 'local-claude-file-bridge')
     assert q1(conn, "SELECT last_crawled_at FROM sieve.source_registry")[0] \
         is not None
+
+
+def test_ingest_extracted_supersedes_receipt_missing_from_new_text(conn, tmp_path,
+                                                                   monkeypatch):
+    """The production file bridge must apply the same content reconciliation
+    as the API-backed cron path before it consumes a changed page."""
+    from sieve_ingest import db
+    add_source(conn)
+    url = 'https://example.test/guide'
+    doc = db.upsert_document(conn, url, 'TestOrg', 'Guide', 'seo')
+    db.upsert_rule(
+        conn,
+        {'name': 'Use JSON-LD', 'if_condition': 'structured data exists',
+         'then_logic': 'emit JSON-LD', 'domain_tag': 'seo',
+         'source_excerpt': 'Use JSON-LD for structured data.',
+         'confidence_score': 0.9},
+        doc_id=doc, source_url=url, source_org='TestOrg', content_hash='old-hash')
+
+    infile = tmp_path / 'changed.jsonl'
+    infile.write_text(json.dumps({
+        'source_id': 'test-src', 'org': 'TestOrg', 'url': url,
+        'title': 'Guide', 'text': 'This page now contains unrelated release notes.',
+        'new_hash': 'new-hash', 'rules': [],
+    }) + '\n')
+    ie = _load_script('ingest_extracted',
+                      ['ingest_extracted.py', str(infile)], monkeypatch)
+    ie.main()
+
+    assert q1(conn, "SELECT status, provenance_status FROM sieve.rules") == \
+        ('superseded', 'source_changed')
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +340,8 @@ def test_rewrite_dropping_rule_stops_restamps(conn, web, fake_llm):
     fake_llm['mode'] = 'empty'
     make_due(conn)
     assert _cycle()['urls_changed'] == 1
+    assert q1(conn, "SELECT status, provenance_status FROM sieve.rules") == \
+        ('superseded', 'source_changed')
 
     # Unchanged observations of the rewritten version must stamp nothing:
     # the old rule was never confirmed from this content.
@@ -314,6 +351,28 @@ def test_rewrite_dropping_rule_stops_restamps(conn, web, fake_llm):
     assert summary['rules_verified'] == 0
     assert q1(conn, "SELECT last_verified < now() - interval '29 days' "
                     "FROM sieve.rules")[0] is True
+
+
+def test_rewrite_retaining_exact_excerpt_rebinds_proof_to_new_hash(conn, web,
+                                                                   fake_llm):
+    """A harmless page rewrite must not discard proof when the exact quoted
+    guidance remains present; the receipt moves to the newly fetched version."""
+    add_source(conn)
+    url = 'https://example.test/guide'
+    web.sitemap['https://example.test/sitemap.xml'] = [(url, None)]
+    web.pages[url] = SEO_PAGE
+    assert _cycle()['rules_written'] == 1
+    old_hash = q1(conn, "SELECT source_content_hash FROM sieve.rules")[0]
+
+    web.pages[url] = SEO_PAGE.replace(
+        '</main>', '<p>Additional unrelated release notes.</p></main>', 1)
+    fake_llm['mode'] = 'empty'
+    make_due(conn)
+    assert _cycle()['urls_changed'] == 1
+    row = q1(conn, "SELECT status, provenance_status, source_content_hash "
+                   "FROM sieve.rules")
+    assert row[0:2] == ('active', 'verified_excerpt')
+    assert row[2] and row[2] != old_hash
 
 
 def test_gave_up_version_never_verifies(conn, web, fake_llm, monkeypatch):

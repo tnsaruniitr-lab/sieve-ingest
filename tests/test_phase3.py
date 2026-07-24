@@ -50,14 +50,16 @@ def test_quality_gate_rejects_low_confidence_and_incomplete(conn, web, fake_llm,
     web.pages['https://example.test/guide'] = SEO_PAGE.format('x')
 
     def sketchy(text, org, url):
+        excerpt = 'Structured data and sitemaps help search engines crawl'
         return [
             {'name': 'good', 'if_condition': 'a', 'then_logic': 'b',
-             'confidence_score': 0.9},
+             'source_excerpt': excerpt, 'confidence_score': 0.9},
             {'name': 'low-conf', 'if_condition': 'a', 'then_logic': 'b',
-             'confidence_score': 0.3},
-            {'name': 'no-then', 'if_condition': 'a', 'confidence_score': 0.95},
+             'source_excerpt': excerpt, 'confidence_score': 0.3},
+            {'name': 'no-then', 'if_condition': 'a', 'source_excerpt': excerpt,
+             'confidence_score': 0.95},
             {'name': 'bad-conf', 'if_condition': 'a', 'then_logic': 'b',
-             'confidence_score': 'high'},
+             'source_excerpt': excerpt, 'confidence_score': 'high'},
         ]
     monkeypatch.setattr(extract, '_extract_rules', sketchy)
     summary = _cycle()
@@ -96,7 +98,31 @@ def test_new_rules_carry_extracted_provenance(conn, web, fake_llm):
         ('https://example.test/guide', None)]
     web.pages['https://example.test/guide'] = SEO_PAGE.format('x')
     _cycle()
-    assert q1(conn, "SELECT url_provenance FROM sieve.rules")[0] == 'extracted'
+    assert q1(conn, "SELECT url_provenance, provenance_status, "
+                    "source_excerpt IS NOT NULL, source_content_hash IS NOT NULL "
+                    "FROM sieve.rules") == ('extracted', 'verified_excerpt', True, True)
+
+
+def test_quality_gate_rejects_paraphrased_source_excerpt():
+    from sieve_ingest import extract
+    source = 'Google recommends using descriptive page titles in search results.'
+    rules = [{'name': 'Write titles', 'if_condition': 'a page exists',
+              'then_logic': 'use a descriptive title',
+              'source_excerpt': 'Always add perfect title tags for higher rankings.',
+              'confidence_score': 0.99}]
+    kept, rejected = extract._validate_rules(rules, 'https://example.test', source)
+    assert kept == [] and rejected == 1
+
+
+def test_quality_gate_requires_case_faithful_source_excerpt():
+    from sieve_ingest import extract
+    source = 'Google recommends using descriptive page titles in search results.'
+    rules = [{'name': 'Write titles', 'if_condition': 'a page exists',
+              'then_logic': 'use a descriptive title',
+              'source_excerpt': 'google recommends using descriptive page titles',
+              'confidence_score': 0.99}]
+    kept, rejected = extract._validate_rules(rules, 'https://example.test', source)
+    assert kept == [] and rejected == 1
 
 
 def test_long_docs_chunk_instead_of_truncate():
